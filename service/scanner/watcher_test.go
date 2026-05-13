@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -137,6 +138,73 @@ func TestWatcher_WikiMdDeleteMarksDirty(t *testing.T) {
 		n, _ := nodes.Get(root)
 		return n != nil && n.Dirty
 	}, 2*time.Second, 50*time.Millisecond)
+}
+
+func TestWatcher_NewDirWithContents_BackfillEvents(t *testing.T) {
+	w, events, _, root := setupWatcher(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx)
+
+	// Simulate `cp -r` / `mv non_container_dir into_watched`:
+	// build the dir tree outside the watched root, then rename into place atomically.
+	staging := filepath.Join(t.TempDir(), "staging")
+	require.NoError(t, os.MkdirAll(filepath.Join(staging, "sub"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(staging, "a.txt"), []byte("x"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(staging, "sub", "b.txt"), []byte("y"), 0644))
+
+	target := filepath.Join(root, "moved")
+	require.NoError(t, os.Rename(staging, target))
+
+	require.Eventually(t, func() bool {
+		evs, _ := events.ListUnprocessed(50)
+		hasA := false
+		hasB := false
+		for _, e := range evs {
+			if e.Path == filepath.Join(target, "a.txt") {
+				hasA = true
+			}
+			if e.Path == filepath.Join(target, "sub", "b.txt") {
+				hasB = true
+			}
+		}
+		return hasA && hasB
+	}, 3*time.Second, 100*time.Millisecond)
+}
+
+func TestWatcher_NewDirContainingContainer_RecordedOpaque(t *testing.T) {
+	w, events, _, root := setupWatcher(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx)
+
+	// Move-in a tree that has a node_modules inside it
+	staging := filepath.Join(t.TempDir(), "staging")
+	require.NoError(t, os.MkdirAll(filepath.Join(staging, "node_modules", "lodash"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(staging, "node_modules", "lodash", "x.js"), []byte(""), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(staging, "main.go"), []byte(""), 0644))
+
+	target := filepath.Join(root, "proj")
+	require.NoError(t, os.Rename(staging, target))
+
+	require.Eventually(t, func() bool {
+		evs, _ := events.ListUnprocessed(50)
+		sawOpaqueNm := false
+		sawMainGo := false
+		for _, e := range evs {
+			if e.Path == filepath.Join(target, "node_modules") && e.IsDir {
+				sawOpaqueNm = true
+			}
+			if e.Path == filepath.Join(target, "main.go") {
+				sawMainGo = true
+			}
+			// descendants of node_modules must NOT be present
+			if strings.Contains(e.Path, filepath.Join("node_modules", "lodash")) {
+				t.Fatalf("descendant of container dir leaked into events: %s", e.Path)
+			}
+		}
+		return sawOpaqueNm && sawMainGo
+	}, 3*time.Second, 100*time.Millisecond)
 }
 
 func TestWatcher_ContainerDirSkipped(t *testing.T) {

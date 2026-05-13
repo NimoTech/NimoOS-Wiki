@@ -125,6 +125,14 @@ func (w *Watcher) handle(ev fsnotify.Event) {
 	}
 
 	// PATH 3: regular file/dir
+
+	// Defensive: ignore events whose parent is a container dir. Must come
+	// before the Create-dir branch so we don't accidentally register a watch
+	// on a child of a container dir.
+	if w.parentIsContainer(ev.Name) {
+		return
+	}
+
 	// If a new dir is created, register it (unless container, in which case
 	// record one opaque event and don't add a recursive watch).
 	if ev.Op&fsnotify.Create != 0 {
@@ -134,12 +142,13 @@ func (w *Watcher) handle(ev fsnotify.Event) {
 				return
 			}
 			_ = w.fsw.Add(ev.Name)
+			// Walk the new dir to backfill events for any pre-existing
+			// descendants (cp -r, mv, tar x). fsnotify only emits Create on
+			// the dir itself; descendants need discovery via a walk.
+			w.backfillNewDir(rootID, ev.Name)
+			// Note: the top-level Create event for ev.Name itself still gets
+			// recorded via the normal path-3 flow below.
 		}
-	}
-
-	// Defensive: ignore events whose parent is a container dir
-	if w.parentIsContainer(ev.Name) {
-		return
 	}
 
 	op := mapOp(ev.Op)
@@ -237,4 +246,33 @@ func (w *Watcher) rootIDFor(p string) string {
 func (w *Watcher) parentIsContainer(p string) bool {
 	parent := filepath.Dir(p)
 	return w.ig.IsContainerDir(filepath.Base(parent))
+}
+
+// backfillNewDir handles dirs that may have contained entries at creation time
+// (e.g., cp -r, mv, tar x). fsnotify only emits Create on the dir itself;
+// descendants need to be discovered via a walk.
+func (w *Watcher) backfillNewDir(rootID, dir string) {
+	_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if p == dir {
+			return nil // already handled by caller
+		}
+		base := filepath.Base(p)
+		if w.ig.IsSystemIgnoredBasename(base) || w.ig.IsWikiFile(base) || w.ig.IsWikiTmpFile(base) {
+			return nil
+		}
+		if d.IsDir() && w.ig.IsContainerDir(base) {
+			w.insertEvent(rootID, p, "create", true)
+			return filepath.SkipDir
+		}
+		if d.IsDir() {
+			if err := w.fsw.Add(p); err != nil {
+				w.log.Warn("backfill: fsw.Add failed", zap.String("path", p), zap.Error(err))
+			}
+		}
+		w.insertEvent(rootID, p, "create", d.IsDir())
+		return nil
+	})
 }
