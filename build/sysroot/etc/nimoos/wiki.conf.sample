@@ -1,0 +1,15 @@
+[common]
+RuntimePath = /var/run/nimoos
+DataPath = /var/lib/nimoos/wiki
+LogPath = /var/log/nimoos
+
+[wiki]
+DefaultScanIntervalSec = 21600
+ScanOnlyScanIntervalSec = 600
+WikiWriteDebounceSec = 5
+EventDebounceMs = 200
+ChildMapAggregateThreshold = 50
+RecentChangesKeep = 20
+RecentChangesRetentionDays = 90
+ShutdownFlushTimeoutSec = 5
+ContainerDirs = node_modules,.git,__pycache__,venv,.venv,.tox,target,build,dist,.next,.nuxt,vendor,.gradle,.cargo,.cache,.idea,.vscode
