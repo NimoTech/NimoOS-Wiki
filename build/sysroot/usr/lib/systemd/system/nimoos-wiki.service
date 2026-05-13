@@ -1,0 +1,14 @@
+[Unit]
+Description=NimoOS Wiki Service
+After=nimoos-gateway.service nimoos-message-bus.service nimoos-local-storage.service
+Wants=nimoos-message-bus.service
+
+[Service]
+ExecStartPre=/usr/bin/nimoos-wiki -v
+ExecStart=/usr/bin/nimoos-wiki -c /etc/nimoos/wiki.conf
+PIDFile=/var/run/nimoos/wiki.pid
+Restart=always
+Type=notify
+
+[Install]
+WantedBy=multi-user.target
