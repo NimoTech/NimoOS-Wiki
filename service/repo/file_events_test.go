@@ -1,0 +1,34 @@
+package repo
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestFileEvents_ArchiveAndPurge(t *testing.T) {
+	d := openTestDB(t)
+	r := NewFileEvents(d)
+	now := time.Now().UnixMilli()
+	day := int64(24 * 3600 * 1000)
+	_ = r.Insert(FileEvent{RootID: "r", Path: "/old", Op: "create", DetectedAt: now - 100*day})
+	_ = r.Insert(FileEvent{RootID: "r", Path: "/older", Op: "create", DetectedAt: now - 200*day})
+	_ = r.Insert(FileEvent{RootID: "r", Path: "/fresh", Op: "create", DetectedAt: now})
+
+	n, _ := r.ArchiveOlderThan(now - 90*day)
+	require.Equal(t, int64(2), n, "two events archived")
+
+	n2, _ := r.PurgeOlderThan(now - 180*day)
+	require.Equal(t, int64(1), n2, "one event purged")
+}
+
+func TestFileEvents_RecentForNode_CaseSensitive(t *testing.T) {
+	d := openTestDB(t)
+	r := NewFileEvents(d)
+	_ = r.Insert(FileEvent{RootID: "r", Path: "/DATA/ProjectA/x.go", Op: "create", DetectedAt: 1})
+	_ = r.Insert(FileEvent{RootID: "r", Path: "/DATA/projecta/y.go", Op: "create", DetectedAt: 2})
+	out, _ := r.RecentForNode("r", "/DATA/ProjectA", 10)
+	require.Len(t, out, 1)
+	require.Equal(t, "/DATA/ProjectA/x.go", out[0].Path)
+}

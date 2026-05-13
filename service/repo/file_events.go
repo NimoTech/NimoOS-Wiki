@@ -1,0 +1,162 @@
+package repo
+
+import (
+	"database/sql"
+	"strings"
+)
+
+type FileEventsRepo struct{ db *sql.DB }
+
+func NewFileEvents(d *sql.DB) *FileEventsRepo { return &FileEventsRepo{d} }
+
+func (r *FileEventsRepo) Insert(e FileEvent) error {
+	if e.ID == "" {
+		e.ID = NewID()
+	}
+	_, err := r.db.Exec(`INSERT INTO file_events
+		(id, root_id, path, op, rename_to, is_dir, detected_at, processed_at, archived)
+		VALUES (?,?,?,?,?,?,?,?,?)`,
+		e.ID, e.RootID, e.Path, e.Op, nullableStr(e.RenameTo), b2i(e.IsDir),
+		e.DetectedAt, nullable(e.ProcessedAt), b2i(e.Archived))
+	return err
+}
+
+const evCols = `id, root_id, path, op, COALESCE(rename_to,''), is_dir, detected_at,
+	COALESCE(processed_at, 0), archived`
+
+func (r *FileEventsRepo) scan(row interface{ Scan(...interface{}) error }) (*FileEvent, error) {
+	e := &FileEvent{}
+	var isDir, archived int
+	err := row.Scan(&e.ID, &e.RootID, &e.Path, &e.Op, &e.RenameTo, &isDir,
+		&e.DetectedAt, &e.ProcessedAt, &archived)
+	if err != nil {
+		return nil, err
+	}
+	e.IsDir = isDir == 1
+	e.Archived = archived == 1
+	return e, nil
+}
+
+func (r *FileEventsRepo) ListUnprocessed(limit int) ([]FileEvent, error) {
+	rows, err := r.db.Query(`SELECT `+evCols+` FROM file_events
+		WHERE processed_at IS NULL ORDER BY detected_at LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FileEvent
+	for rows.Next() {
+		e, err := r.scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *e)
+	}
+	return out, rows.Err()
+}
+
+func (r *FileEventsRepo) ListSince(rootID string, sinceMs int64, limit int) ([]FileEvent, error) {
+	rows, err := r.db.Query(`SELECT `+evCols+` FROM file_events
+		WHERE root_id = ? AND archived = 0 AND detected_at > ?
+		ORDER BY detected_at LIMIT ?`, rootID, sinceMs, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FileEvent
+	for rows.Next() {
+		e, err := r.scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *e)
+	}
+	return out, rows.Err()
+}
+
+func (r *FileEventsRepo) RecentForRoot(rootID string, limit int) ([]FileEvent, error) {
+	rows, err := r.db.Query(`SELECT `+evCols+` FROM file_events
+		WHERE root_id = ? ORDER BY detected_at DESC LIMIT ?`, rootID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FileEvent
+	for rows.Next() {
+		e, err := r.scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *e)
+	}
+	return out, rows.Err()
+}
+
+func (r *FileEventsRepo) RecentForNode(rootID, nodePath string, limit int) ([]FileEvent, error) {
+	pattern := EscapeLikeArg(nodePath) + `/%`
+	rows, err := r.db.Query(`SELECT `+evCols+` FROM file_events
+		WHERE root_id = ? AND (path = ? OR path LIKE ? ESCAPE '\')
+		ORDER BY detected_at DESC LIMIT ?`, rootID, nodePath, pattern, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FileEvent
+	for rows.Next() {
+		e, err := r.scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *e)
+	}
+	return out, rows.Err()
+}
+
+func (r *FileEventsRepo) MarkProcessed(ids []string, atMs int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	q := `UPDATE file_events SET processed_at = ? WHERE id IN (?` + strings.Repeat(",?", len(ids)-1) + `)`
+	args := make([]interface{}, 0, len(ids)+1)
+	args = append(args, atMs)
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	_, err := r.db.Exec(q, args...)
+	return err
+}
+
+func (r *FileEventsRepo) ArchiveOlderThan(cutoffMs int64) (int64, error) {
+	res, err := r.db.Exec(`UPDATE file_events SET archived = 1
+		WHERE archived = 0 AND detected_at < ?`, cutoffMs)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (r *FileEventsRepo) PurgeOlderThan(cutoffMs int64) (int64, error) {
+	res, err := r.db.Exec(`DELETE FROM file_events WHERE detected_at < ?`, cutoffMs)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (r *FileEventsRepo) RewritePathPrefix(tx *sql.Tx, rootID, oldPrefix, newPrefix string) error {
+	pattern := EscapeLikeArg(oldPrefix) + `/%`
+	subStart := len(oldPrefix) + 1
+	_, err := tx.Exec(`UPDATE file_events
+		SET path = ? || SUBSTR(path, ?)
+		WHERE root_id = ? AND processed_at IS NULL
+		  AND (path = ? OR path LIKE ? ESCAPE '\')`,
+		newPrefix, subStart, rootID, oldPrefix, pattern)
+	return err
+}
+
+func nullableStr(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
+}
