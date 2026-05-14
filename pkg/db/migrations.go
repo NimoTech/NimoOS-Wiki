@@ -75,6 +75,38 @@ var migrations = []string{
 	`CREATE INDEX IF NOT EXISTS idx_parse_status_pending ON parse_status(status) WHERE status IN ('pending', 'failed')`,
 }
 
+// addColumnIfMissing runs `ALTER TABLE t ADD COLUMN ...` only if `col` is not
+// already a column of `table`. SQLite has no `ADD COLUMN IF NOT EXISTS`.
+//
+// Note: if `table` does not exist, PRAGMA table_info returns empty rows and
+// the subsequent ALTER TABLE will fail with a real error — that is the correct
+// behavior for our callers (tables are always created by the migrations loop
+// above before addColumnIfMissing is called).
+func addColumnIfMissing(d *sql.DB, table, col, defn string) error {
+	rows, err := d.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == col {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = d.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, col, defn))
+	return err
+}
+
 func runMigrations(d *sql.DB) error {
 	for _, stmt := range migrations {
 		if _, err := d.Exec(stmt); err != nil {
@@ -84,6 +116,10 @@ func runMigrations(d *sql.DB) error {
 			}
 			return fmt.Errorf("migration failed (%s): %w", head, err)
 		}
+	}
+	// Post-create ALTERs go below — use addColumnIfMissing for idempotency.
+	if err := addColumnIfMissing(d, "wiki_nodes", "ai_label", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return fmt.Errorf("add wiki_nodes.ai_label: %w", err)
 	}
 	return nil
 }
