@@ -103,6 +103,47 @@ func TestWikiNode_AILabel_Roundtrip(t *testing.T) {
 	}
 }
 
+func TestWikiNode_List_EmptyRootID_ReturnsAllNodes(t *testing.T) {
+	d := openTestDB(t)
+	r := NewWikiNodes(d)
+
+	rootA := "root-a"
+	rootB := "root-b"
+	for _, spec := range []struct {
+		id, path, level string
+		root            *string
+	}{
+		{"id-a-1", "/A", "space", &rootA},
+		{"id-a-2", "/A/proj", "project", &rootA},
+		{"id-b-1", "/B", "space", &rootB},
+		{"id-b-2", "/B/proj", "project", &rootB},
+	} {
+		if err := r.Upsert(WikiNode{
+			ID: spec.id, RootID: spec.root, Path: spec.path, Level: spec.level,
+			LastModified: 1, UpdatedAt: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := r.List("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("List(\"\") len=%d want 4 (all nodes across both roots)", len(got))
+	}
+
+	// Sanity: List(rootA) still scopes correctly
+	gotA, err := r.List(rootA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gotA) != 2 {
+		t.Fatalf("List(rootA) len=%d want 2", len(gotA))
+	}
+}
+
 func TestWikiNode_List_ReturnsAILabelAndTimestamps(t *testing.T) {
 	d := openTestDB(t)
 	r := NewWikiNodes(d)

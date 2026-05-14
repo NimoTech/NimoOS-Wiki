@@ -173,6 +173,39 @@ func TestGetTree_IncludesAILabelAndTimestamps(t *testing.T) {
 	}
 }
 
+func TestGetTree_NoRootID_ReturnsAllRoots(t *testing.T) {
+	dep, _ := setupTestRouter(t)
+	rootA := "rA"
+	rootB := "rB"
+	dep.Nodes.Upsert(repo.WikiNode{
+		ID: "a", RootID: &rootA, Path: "/A", Level: "space",
+		LastModified: 1, UpdatedAt: 1,
+	})
+	dep.Nodes.Upsert(repo.WikiNode{
+		ID: "b", RootID: &rootB, Path: "/B", Level: "space",
+		LastModified: 1, UpdatedAt: 1,
+	})
+
+	e := echo.New()
+	g := e.Group("/v1/wiki")
+	g.GET("/tree", getTree(dep))
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/wiki/tree", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp) != 2 {
+		t.Fatalf("len=%d want 2 (both roots' nodes when no root_id given)", len(resp))
+	}
+}
+
 func TestGetRecentChanges_AcceptsSinceMsAndLimit(t *testing.T) {
 	dep, _ := setupTestRouter(t)
 	root := "r1"

@@ -81,7 +81,13 @@ func (r *WikiNodesRepo) GetByID(id string) (*WikiNode, error) {
 }
 
 func (r *WikiNodesRepo) List(rootID string) ([]WikiNode, error) {
-	rows, err := r.db.Query(`SELECT `+nodeSelectCols+` FROM wiki_nodes WHERE root_id = ?`, rootID)
+	var rows *sql.Rows
+	var err error
+	if rootID == "" {
+		rows, err = r.db.Query(`SELECT ` + nodeSelectCols + ` FROM wiki_nodes`)
+	} else {
+		rows, err = r.db.Query(`SELECT `+nodeSelectCols+` FROM wiki_nodes WHERE root_id = ?`, rootID)
+	}
 	if err != nil {
 		return nil, err
 	}
