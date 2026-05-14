@@ -27,6 +27,7 @@ type WikiNode struct {
 	LastFlushedAt      int64
 	LastFlushedMtime   int64
 	UpdatedAt          int64
+	AILabel            string // set by future AI summary worker; empty until then
 }
 
 type FileIndex struct {

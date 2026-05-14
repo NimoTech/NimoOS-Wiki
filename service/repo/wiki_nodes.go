@@ -17,8 +17,8 @@ func (r *WikiNodesRepo) Upsert(n WikiNode) error {
 	_, err := r.db.Exec(`INSERT INTO wiki_nodes
 		(id, root_id, path, level, child_count, last_modified, checksum_system,
 		 user_notes, user_notes_etag, user_notes_updated_at, dirty,
-		 last_flushed_at, last_flushed_mtime, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 last_flushed_at, last_flushed_mtime, updated_at, ai_label)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(path) DO UPDATE SET
 			root_id=excluded.root_id,
 			level=excluded.level,
@@ -31,10 +31,11 @@ func (r *WikiNodesRepo) Upsert(n WikiNode) error {
 			dirty=excluded.dirty,
 			last_flushed_at=excluded.last_flushed_at,
 			last_flushed_mtime=excluded.last_flushed_mtime,
-			updated_at=excluded.updated_at`,
+			updated_at=excluded.updated_at,
+			ai_label=excluded.ai_label`,
 		n.ID, n.RootID, n.Path, n.Level, n.ChildCount, nullable(n.LastModified),
 		n.ChecksumSystem, n.UserNotes, n.UserNotesETag, nullable(n.UserNotesUpdatedAt),
-		b2i(n.Dirty), nullable(n.LastFlushedAt), nullable(n.LastFlushedMtime), n.UpdatedAt)
+		b2i(n.Dirty), nullable(n.LastFlushedAt), nullable(n.LastFlushedMtime), n.UpdatedAt, n.AILabel)
 	return err
 }
 
@@ -44,7 +45,7 @@ func (r *WikiNodesRepo) scan(row interface{ Scan(...interface{}) error }) (*Wiki
 	var dirty int
 	err := row.Scan(&n.ID, &rootID, &n.Path, &n.Level, &n.ChildCount,
 		&n.LastModified, &n.ChecksumSystem, &n.UserNotes, &n.UserNotesETag,
-		&n.UserNotesUpdatedAt, &dirty, &n.LastFlushedAt, &n.LastFlushedMtime, &n.UpdatedAt)
+		&n.UserNotesUpdatedAt, &dirty, &n.LastFlushedAt, &n.LastFlushedMtime, &n.UpdatedAt, &n.AILabel)
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +59,8 @@ func (r *WikiNodesRepo) scan(row interface{ Scan(...interface{}) error }) (*Wiki
 const nodeSelectCols = `id, root_id, path, level, child_count,
 	COALESCE(last_modified,0), COALESCE(checksum_system,''),
 	user_notes, user_notes_etag, COALESCE(user_notes_updated_at,0),
-	dirty, COALESCE(last_flushed_at,0), COALESCE(last_flushed_mtime,0), updated_at`
+	dirty, COALESCE(last_flushed_at,0), COALESCE(last_flushed_mtime,0), updated_at,
+	COALESCE(ai_label,'')`
 
 func (r *WikiNodesRepo) Get(path string) (*WikiNode, error) {
 	row := r.db.QueryRow(`SELECT `+nodeSelectCols+` FROM wiki_nodes WHERE path = ?`, path)

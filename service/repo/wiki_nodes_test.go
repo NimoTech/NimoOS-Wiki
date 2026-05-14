@@ -70,3 +70,71 @@ func TestWikiNodes_RewritePathPrefix_EscapesUnderscore(t *testing.T) {
 	got2, _ := r.Get("/DATA/aXb")
 	require.NotNil(t, got2, "/DATA/aXb must NOT be touched (underscore escaped)")
 }
+
+func TestWikiNode_AILabel_Roundtrip(t *testing.T) {
+	d := openTestDB(t)
+	r := NewWikiNodes(d)
+	n := WikiNode{
+		ID:                 "n1",
+		Path:               "/DATA/Projects/x",
+		Level:              "project",
+		LastModified:       1700000000000,
+		UserNotes:          "hello",
+		UserNotesETag:      "e1",
+		UserNotesUpdatedAt: 1700000005000,
+		UpdatedAt:          1700000010000,
+		AILabel:            "Go 微服务项目",
+	}
+	if err := r.Upsert(n); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.Get("/DATA/Projects/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Fatal("nil node")
+	}
+	if got.AILabel != "Go 微服务项目" {
+		t.Fatalf("AILabel=%q want %q", got.AILabel, "Go 微服务项目")
+	}
+	if got.LastModified != 1700000000000 {
+		t.Fatalf("LastModified roundtrip: %d", got.LastModified)
+	}
+}
+
+func TestWikiNode_List_ReturnsAILabelAndTimestamps(t *testing.T) {
+	d := openTestDB(t)
+	r := NewWikiNodes(d)
+	root := "rootA"
+	for _, p := range []string{"/DATA", "/DATA/Projects/x", "/DATA/Projects/y"} {
+		n := WikiNode{
+			ID:                 "id-" + p,
+			RootID:             &root,
+			Path:               p,
+			Level:              "project",
+			LastModified:       1700000000000,
+			UserNotesUpdatedAt: 1700000005000,
+			UpdatedAt:          1700000010000,
+			AILabel:            "label-" + p,
+		}
+		if err := r.Upsert(n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := r.List(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("List len=%d want 3", len(got))
+	}
+	for _, n := range got {
+		if n.AILabel != "label-"+n.Path {
+			t.Errorf("AILabel=%q for path=%q", n.AILabel, n.Path)
+		}
+		if n.LastModified != 1700000000000 {
+			t.Errorf("LastModified=%d for path=%q", n.LastModified, n.Path)
+		}
+	}
+}
