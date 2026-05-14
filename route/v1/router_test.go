@@ -3,6 +3,7 @@ package v1
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -104,4 +105,108 @@ func TestGetNode_MissingReturns404(t *testing.T) {
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestGetNode_IncludesAILabel(t *testing.T) {
+	dep, _ := setupTestRouter(t)
+	root := "r1"
+	dep.Nodes.Upsert(repo.WikiNode{
+		ID: "n1", RootID: &root, Path: "/a/b", Level: "project",
+		AILabel: "labeled", UpdatedAt: 1, LastModified: 1,
+	})
+
+	e := echo.New()
+	g := e.Group("/v1/wiki")
+	g.GET("/node", getNode(dep))
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/wiki/node?path=/a/b", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["ai_label"] != "labeled" {
+		t.Fatalf("ai_label=%v want labeled", resp["ai_label"])
+	}
+}
+
+func TestGetTree_IncludesAILabelAndTimestamps(t *testing.T) {
+	dep, _ := setupTestRouter(t)
+	root := "r1"
+	dep.Nodes.Upsert(repo.WikiNode{
+		ID: "n1", RootID: &root, Path: "/a", Level: "space",
+		AILabel: "spaceA", LastModified: 100, UserNotesUpdatedAt: 200, UpdatedAt: 300,
+	})
+
+	e := echo.New()
+	g := e.Group("/v1/wiki")
+	g.GET("/tree", getTree(dep))
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/wiki/tree?root_id="+root, nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d", rec.Code)
+	}
+	var resp []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp) != 1 {
+		t.Fatalf("len=%d", len(resp))
+	}
+	n := resp[0]
+	if n["ai_label"] != "spaceA" {
+		t.Errorf("ai_label=%v", n["ai_label"])
+	}
+	if int64(n["last_modified_ms"].(float64)) != 100 {
+		t.Errorf("last_modified_ms=%v", n["last_modified_ms"])
+	}
+	if int64(n["user_notes_updated_at"].(float64)) != 200 {
+		t.Errorf("user_notes_updated_at=%v", n["user_notes_updated_at"])
+	}
+}
+
+func TestGetRecentChanges_AcceptsSinceMsAndLimit(t *testing.T) {
+	dep, _ := setupTestRouter(t)
+	root := "r1"
+	// Seed three events at different timestamps
+	for i, ts := range []int64{100, 200, 300} {
+		dep.Events.Insert(repo.FileEvent{
+			ID: fmt.Sprintf("e%d", i), RootID: root,
+			Path: "/x", Op: "create", DetectedAt: ts,
+		})
+	}
+
+	e := echo.New()
+	g := e.Group("/v1/wiki")
+	g.GET("/recent-changes", getRecentChanges(dep))
+
+	// since_ms=150 → expect 2 events (ts 200, 300)
+	req := httptest.NewRequest(http.MethodGet, "/v1/wiki/recent-changes?root_id="+root+"&since_ms=150&limit=10", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp []map[string]any
+	json.Unmarshal(rec.Body.Bytes(), &resp)
+	if len(resp) != 2 {
+		t.Fatalf("len=%d want 2", len(resp))
+	}
+
+	// limit clamping: limit=500 should clamp to 200 (not error)
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/wiki/recent-changes?root_id="+root+"&limit=500", nil)
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("clamp code=%d", rec2.Code)
+	}
 }

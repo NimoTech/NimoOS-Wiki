@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/labstack/echo/v4"
@@ -15,6 +16,7 @@ import (
 type nodeResponse struct {
 	Path          string            `json:"path"`
 	Level         string            `json:"level"`
+	AILabel       string            `json:"ai_label"`
 	Summary       *string           `json:"summary"`
 	ChildMap      []nodeChildEntry  `json:"child_map"`
 	KeySources    []string          `json:"key_sources"`
@@ -82,6 +84,7 @@ func getNode(d Deps) echo.HandlerFunc {
 		return c.JSON(http.StatusOK, nodeResponse{
 			Path:          node.Path,
 			Level:         node.Level,
+			AILabel:       node.AILabel,
 			Summary:       nil,
 			ChildMap:      cms,
 			KeySources:    []string{},
@@ -101,14 +104,22 @@ func getTree(d Deps) echo.HandlerFunc {
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 		}
-		// Skeleton response — just paths and levels.
 		type sk struct {
-			Path  string `json:"path"`
-			Level string `json:"level"`
+			Path               string `json:"path"`
+			Level              string `json:"level"`
+			AILabel            string `json:"ai_label"`
+			UserNotesUpdatedAt int64  `json:"user_notes_updated_at"`
+			LastModifiedMS     int64  `json:"last_modified_ms"`
 		}
 		out := make([]sk, 0, len(nodes))
 		for _, n := range nodes {
-			out = append(out, sk{Path: n.Path, Level: n.Level})
+			out = append(out, sk{
+				Path:               n.Path,
+				Level:              n.Level,
+				AILabel:            n.AILabel,
+				UserNotesUpdatedAt: n.UserNotesUpdatedAt,
+				LastModifiedMS:     n.LastModified,
+			})
 		}
 		return c.JSON(http.StatusOK, out)
 	}
@@ -175,8 +186,15 @@ func putUserNotes(d Deps) echo.HandlerFunc {
 func getRecentChanges(d Deps) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		rootID := c.QueryParam("root_id")
-		limit := 50
-		evs, err := d.Events.RecentForRoot(rootID, limit)
+		sinceMs, _ := strconv.ParseInt(c.QueryParam("since_ms"), 10, 64)
+		limit, _ := strconv.Atoi(c.QueryParam("limit"))
+		if limit < 1 {
+			limit = 50
+		}
+		if limit > 200 {
+			limit = 200
+		}
+		evs, err := d.Events.ListSince(rootID, sinceMs, limit)
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 		}
