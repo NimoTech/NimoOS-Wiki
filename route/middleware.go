@@ -15,10 +15,24 @@ import (
 )
 
 // JWTConfig returns echo's JWT middleware configured for NimoOS.
-// Mirrors NimoOS-AI's pattern: no localhost exemption, ECDSA via JWKS.
+// Localhost exempt for in-host services (Agent, CLI); external requests still
+// require JWT. Localhost-exempt requests honor X-NimoOS-User-ID on
+// c.Request().Header — the same place ParseTokenFunc writes the claim-derived
+// value on the JWT path, so downstream handlers read identity uniformly.
 func JWTConfig(runtimePath string) echo_middleware.JWTConfig {
 	return echo_middleware.JWTConfig{
-		Skipper: func(c echo.Context) bool { return false },
+		Skipper: func(c echo.Context) bool {
+			host, _, err := net.SplitHostPort(c.Request().RemoteAddr)
+			if err != nil {
+				host = c.Request().RemoteAddr
+			}
+			if host != "127.0.0.1" && host != "::1" && host != "localhost" {
+				return false
+			}
+			// Localhost: trust the in-host caller's X-NimoOS-User-ID header
+			// (already on c.Request().Header — no copy needed).
+			return true
+		},
 		ParseTokenFunc: func(token string, c echo.Context) (interface{}, error) {
 			valid, claims, err := jwt.Validate(token, func() (*ecdsa.PublicKey, error) {
 				return external.GetPublicKey(runtimePath)
