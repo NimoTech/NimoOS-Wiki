@@ -94,7 +94,7 @@ func main() {
 	mgr := roots.NewManager(rRoots, rNodes)
 	rec := scanner.NewReconciler(rFiles, rEvents, ig)
 	wch := scanner.NewWatcher(rEvents, rNodes, ig, zapLog)
-	proc := processor.New(d, rFiles, rEvents, rNodes, rParse, bus, zapLog)
+	proc := processor.New(d, rFiles, rEvents, rNodes, rParse, bus, ig, zapLog)
 	proc.SyncIn = wch.SyncOut
 	if config.Cfg.EventDebounceMs > 0 {
 		proc.EventDebounceMs = config.Cfg.EventDebounceMs

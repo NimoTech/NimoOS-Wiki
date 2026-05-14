@@ -100,11 +100,13 @@ func (m *Manager) Create(args CreateArgs) (string, error) {
 		return "", err
 	}
 
-	// Seed an initial wiki_node for the Root itself
+	// Seed an initial wiki_node for the Root itself. Mark dirty so WikiWriter
+	// produces an initial .wiki.md on first flush; otherwise the file only
+	// appears after the first file change in the Root.
 	rootIDCopy := id
 	_ = m.nodes.Upsert(repo.WikiNode{
 		ID: repo.NewID(), RootID: &rootIDCopy, Path: args.Path,
-		Level: args.Level, UpdatedAt: now,
+		Level: args.Level, Dirty: true, UpdatedAt: now,
 	})
 
 	return id, nil

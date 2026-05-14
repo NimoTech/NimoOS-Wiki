@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/NimoTech/NimoOS-Wiki/pkg/db"
+	"github.com/NimoTech/NimoOS-Wiki/pkg/ignore"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
 	"github.com/stretchr/testify/require"
 )
@@ -20,7 +21,7 @@ func setup(t *testing.T) (*EventProcessor, *repo.FileIndexRepo, *repo.FileEvents
 	events := repo.NewFileEvents(d)
 	nodes := repo.NewWikiNodes(d)
 	parse := repo.NewParseStatus(d)
-	p := New(d, files, events, nodes, parse, nil, nil)
+	p := New(d, files, events, nodes, parse, nil, nil, nil)
 	return p, files, events, nodes, d
 }
 
@@ -110,6 +111,40 @@ func TestProcessor_DirNotInsertedPending(t *testing.T) {
 	var n int
 	require.NoError(t, d.QueryRow(`SELECT COUNT(*) FROM parse_status WHERE path = ?`, "/dir").Scan(&n))
 	require.Equal(t, 0, n, "dir should NOT get a parse_status row")
+}
+
+func TestProcessor_CreateDir_ContainerMarkedOpaque(t *testing.T) {
+	// Regression for follow-up fix #2: Watcher-driven create events for
+	// container dirs (e.g. /path/node_modules from backfillNewDir) must
+	// land in file_index with is_opaque=1 so Child Map renders correctly.
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	files := repo.NewFileIndex(d)
+	events := repo.NewFileEvents(d)
+	nodes := repo.NewWikiNodes(d)
+	parse := repo.NewParseStatus(d)
+	ig := ignore.New([]string{"node_modules", ".git"})
+	p := New(d, files, events, nodes, parse, nil, ig, nil)
+
+	now := time.Now().UnixMilli()
+	require.NoError(t, events.Insert(repo.FileEvent{
+		ID: repo.NewID(), RootID: "r", Path: "/proj/node_modules", Op: "create",
+		IsDir: true, DetectedAt: now,
+	}))
+	require.NoError(t, events.Insert(repo.FileEvent{
+		ID: repo.NewID(), RootID: "r", Path: "/proj/main.go", Op: "create",
+		IsDir: false, DetectedAt: now,
+	}))
+	require.NoError(t, p.ProcessBatch(context.Background()))
+
+	nm, _ := files.Get("r", "/proj/node_modules")
+	require.NotNil(t, nm)
+	require.True(t, nm.IsOpaque, "container dir basename should be flagged opaque")
+
+	src, _ := files.Get("r", "/proj/main.go")
+	require.NotNil(t, src)
+	require.False(t, src.IsOpaque)
 }
 
 func TestProcessor_DeleteRemovesFromIndex(t *testing.T) {

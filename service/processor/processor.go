@@ -3,10 +3,12 @@ package processor
 import (
 	"context"
 	"database/sql"
+	"path/filepath"
 	"sort"
 	"time"
 
 	"github.com/NimoTech/NimoOS-Wiki/common"
+	"github.com/NimoTech/NimoOS-Wiki/pkg/ignore"
 	"github.com/NimoTech/NimoOS-Wiki/pkg/pathutil"
 	"github.com/NimoTech/NimoOS-Wiki/service/eventbus"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
@@ -26,6 +28,7 @@ type EventProcessor struct {
 	nodes  *repo.WikiNodesRepo
 	parse  *repo.ParseStatusRepo
 	bus    eventbus.Bus
+	ig     *ignore.Matcher
 	log    *zap.Logger
 
 	SyncIn <-chan scanner.UserNotesSyncTask
@@ -33,9 +36,12 @@ type EventProcessor struct {
 	EventDebounceMs int // default 200
 }
 
+// New constructs an EventProcessor. ig may be nil (in which case create events
+// never flag opaque); pass a real Matcher to propagate container-dir opacity
+// into file_index during Watcher-driven creates.
 func New(d *sql.DB, files *repo.FileIndexRepo, events *repo.FileEventsRepo,
 	nodes *repo.WikiNodesRepo, parse *repo.ParseStatusRepo,
-	bus eventbus.Bus, log *zap.Logger) *EventProcessor {
+	bus eventbus.Bus, ig *ignore.Matcher, log *zap.Logger) *EventProcessor {
 	if log == nil {
 		log = zap.NewNop()
 	}
@@ -44,7 +50,7 @@ func New(d *sql.DB, files *repo.FileIndexRepo, events *repo.FileEventsRepo,
 	}
 	return &EventProcessor{
 		db: d, files: files, events: events, nodes: nodes, parse: parse,
-		bus: bus, log: log, EventDebounceMs: 200,
+		bus: bus, ig: ig, log: log, EventDebounceMs: 200,
 	}
 }
 
@@ -88,9 +94,13 @@ func (p *EventProcessor) ProcessBatch(ctx context.Context) error {
 func (p *EventProcessor) process(ctx context.Context, e repo.FileEvent) error {
 	switch e.Op {
 	case "create":
+		isOpaque := false
+		if e.IsDir && p.ig != nil && p.ig.IsContainerDir(filepath.Base(e.Path)) {
+			isOpaque = true
+		}
 		if err := p.files.Upsert(repo.FileIndex{
 			ID: repo.NewID(), RootID: e.RootID, Path: e.Path, Parent: pathutil.Parent(e.Path),
-			IsDir: e.IsDir, Status: "present", Mtime: e.DetectedAt,
+			IsDir: e.IsDir, IsOpaque: isOpaque, Status: "present", Mtime: e.DetectedAt,
 		}); err != nil {
 			return err
 		}

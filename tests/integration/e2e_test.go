@@ -63,7 +63,7 @@ func newHarness(t *testing.T) (*harness, context.CancelFunc) {
 	h.mgr = roots.NewManager(h.roots, h.nodes)
 	h.rec = scanner.NewReconciler(h.files, h.events, ig)
 	h.watch = scanner.NewWatcher(h.events, h.nodes, ig, nil)
-	h.proc = processor.New(d, h.files, h.events, h.nodes, h.parse, bus, nil)
+	h.proc = processor.New(d, h.files, h.events, h.nodes, h.parse, bus, ig, nil)
 	h.proc.SyncIn = h.watch.SyncOut
 	// 0 debounce window so tests don't wait 5s
 	h.wri = writer.NewWriter(h.nodes, h.files, h.events, bus, 0, nil)
@@ -97,12 +97,11 @@ func (h *harness) startGoroutines() {
 
 func (h *harness) addRoot(t *testing.T, path string) string {
 	t.Helper()
+	// roots.Manager.Create seeds the wiki_node with Dirty=true so
+	// WikiWriter produces the initial .wiki.md without any extra prompting.
 	id, err := h.mgr.Create(roots.CreateArgs{Path: path, Level: "space"})
 	require.NoError(t, err)
 	require.NoError(t, h.watch.Watch(id, path))
-	// Mark the seeded root node dirty so WikiWriter flushes the initial
-	// .wiki.md. In production this happens via the boot reconciler.
-	require.NoError(t, h.nodes.SetDirty(path, true))
 	h.startGoroutines()
 	return id
 }
@@ -252,15 +251,11 @@ func TestE2E_ContainerDir_RecordedOpaque(t *testing.T) {
 	target := filepath.Join(root, "proj")
 	require.NoError(t, os.Rename(staging, target))
 
-	// Let watcher events drain, then run a reconcile to classify dirs as
-	// opaque (the reconciler is responsible for is_opaque classification;
-	// watcher-driven events only carry presence info).
-	time.Sleep(500 * time.Millisecond)
+	// The Watcher's backfillNewDir walks the moved-in tree, emits a single
+	// opaque create event for node_modules (no recursion inside), and
+	// EventProcessor (with the ignore.Matcher injected) sets file_index.IsOpaque=1.
+	// No explicit reconcile needed.
 	rootID := currentRootID(h)
-	require.NoError(t, h.rec.Reconcile(rootID, root))
-
-	// After settling: file_index should have an opaque entry for node_modules
-	// and the descendants should NOT be indexed.
 	require.Eventually(t, func() bool {
 		all, _ := h.files.ListAllByRoot(rootID)
 		hasOpaque := false
