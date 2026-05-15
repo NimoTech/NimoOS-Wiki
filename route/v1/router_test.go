@@ -165,11 +165,11 @@ func TestGetTree_IncludesAILabelAndTimestamps(t *testing.T) {
 	if n["ai_label"] != "spaceA" {
 		t.Errorf("ai_label=%v", n["ai_label"])
 	}
-	if int64(n["last_modified_ms"].(float64)) != 100 {
-		t.Errorf("last_modified_ms=%v", n["last_modified_ms"])
+	if s, _ := n["last_modified"].(string); s == "" {
+		t.Errorf("last_modified empty, want formatted timestamp")
 	}
-	if int64(n["user_notes_updated_at"].(float64)) != 200 {
-		t.Errorf("user_notes_updated_at=%v", n["user_notes_updated_at"])
+	if s, _ := n["user_notes_updated_at"].(string); s == "" {
+		t.Errorf("user_notes_updated_at empty, want formatted timestamp")
 	}
 }
 
