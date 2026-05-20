@@ -20,7 +20,14 @@ import (
 type UserNotesSyncTask struct {
 	RootID     string
 	WikiMDPath string // absolute path to the .wiki.md file
-	NodePath   string // dir owning the wiki node
+	// NodePath is the absolute path of the directory owning the wiki node.
+	// IMPORTANT: this string is used as the key for nodelock.Locks.Lock(),
+	// and MUST match exactly what WikiWriter.FlushOne uses as its nodePath
+	// argument (which is wiki_nodes.Path from the DB). The invariant holds
+	// today because both originate from filepath.Clean'd paths set in
+	// roots.Manager.Create — break this invariant and the per-node mutex
+	// silently stops serializing.
+	NodePath string
 }
 
 type Watcher struct {

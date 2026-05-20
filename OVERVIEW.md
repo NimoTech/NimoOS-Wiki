@@ -81,9 +81,9 @@ Wiki 只做**导航地图**;**内容搜索**(向量库 / 全文索引)是接下�
 | 事件 | 实施状态 | 备注 |
 |---|---|---|
 | `Wiki:NodeUpdated` | ✅ 已发 | 节点落盘后,`{path, root_id}` |
-| `Wiki:RecentChanged` | ✅ 已发(**每条事件都发一次,无节流**) | `{root_id}`,大批量文件操作会形成同等数量的 publish,见「实施现状 #2」 |
+| `Wiki:RecentChanged` | ✅ 已发(按 batch 聚合) | `{root_id}`,一次 `ProcessBatch` 内每个 root 最多 publish 一次,避免大批量操作刷屏 |
 | `Wiki:PendingChanged` | ❌ 未发 | spec 里规划的事件,代码里没人发送 |
-| `Wiki:RootEnabled` / `Wiki:RootDisabled` | ❌ 未发 | 同上,设计有、代码无 |
+| `Wiki:RootEnabled` / `Wiki:RootDisabled` | ✅ 已发 | Create/Delete 成功后发送,payload `{root_id, path, level}` |
 | `Wiki:WriteFailed` | ❌ 未发 | spec 设想连续 5 次失败告警,代码只是记日志 |
 
 ---
@@ -279,7 +279,7 @@ go test -tags integration ./tests/...      # E2E (~10s,涉及 fsnotify)
 |---|---|---|---|
 | `storage_mode=mirror` | 2026-05-13 §5(line 317)、§8.1 | `WikiWriter` 始终写 `<root>/.wiki.md`,无 mirror 分支 | 不可写 Root 没有 fallback;写测试失败的提示信息在骗用户 |
 | inotify watch 上限检测降级 | 2026-05-13 §9 line 577 | 没有读 `/proc/sys/fs/inotify/max_user_watches`,触顶时只能静默丢 watch | 大型 NAS 上部分目录失去实时事件,只能靠 6h 周期 reconcile 兜底 |
-| `Wiki:PendingChanged` / `Wiki:RootEnabled` / `Wiki:RootDisabled` / `Wiki:WriteFailed` 事件 | 2026-05-13 §7.4 | 完全没人 publish | UI / 监控拿不到这些信号 |
+| `Wiki:PendingChanged` / `Wiki:WriteFailed` 事件 | 2026-05-13 §7.4 | 完全没人 publish | UI / 监控拿不到 pending 计数变化和写盘失败告警(`Wiki:RootEnabled`/`Wiki:RootDisabled` 已实施于 2026-05-20) |
 | Root 路径运行时消失自动标 `enabled=0` | 2026-05-13 §9 line 574 | Watcher 报错只记日志,不动 `enabled` | 拔盘后 wiki_root 仍是 enabled,反复试写失败 |
 | `wiki_nodes.level='system'` 单例顶层节点 | 2026-05-13 §4.1 schema | 无任何 seed 路径,完全死代码 | 实际只有两层(space / project),三层结构是假的 |
 | 用户手编 system 区后备份到 user-notes 上方 | 2026-05-13 §9 line 576 | WikiWriter 不读现有文件,被破坏的 system 区直接被下次 flush 覆盖,无备份 | 用户手贱在 system 区写的东西会无声丢失 |
@@ -290,13 +290,13 @@ go test -tags integration ./tests/...      # E2E (~10s,涉及 fsnotify)
 | 项 | 当前缺陷 |
 |---|---|
 | user-notes 反向同步 | `Watcher.SyncOut` chan 容量 64,满了 `default` 丢弃 → 一次外部编辑事件丢了之后,这次编辑的笔记永远进不了 DB,得等用户再改一次 |
-| WikiWriter ↔ reverse-sync 之间的 user_notes 时序 | spec §6.5 强调了 mtime + DB commit 的顺序,但**没**把"读 user_notes → 渲染 → 写盘"和"反向同步写 user_notes"放进同一事务。两条流程都是独立 goroutine,理论上 WikiWriter 可能用 stale user_notes 覆盖盘上更新的内容 |
-| 服务停机期间 `.wiki.md` 的外部编辑 | spec §6.3 要求 boot 跑 reconciler 兜底,但 reconciler 不索引 `.wiki.md`(它是输出,不入 file_index)→ 停机期间的编辑既没被 reconciler 发现,也不会触发 fsnotify(因为没有运行时事件源)→ 静默丢失 |
+| WikiWriter ↔ reverse-sync 之间的 user_notes 时序 | ~~spec §6.5 强调了 mtime + DB commit 的顺序~~ **已修复 2026-05-20**:`pkg/nodelock` 提供 per-path mutex,Writer.FlushOne 和 Processor.SyncUserNotesFromDisk 通过 `main.go` 注入的共享 `*nodelock.Locks` 在同 nodePath 上串行 |
+| 服务停机期间 `.wiki.md` 的外部编辑 | **已修复 2026-05-20**:`Processor.BootSyncRoot` 在 main.go 启动时(`bootReconcile` 之后、watcher 注册之前)对每个 enabled root 的所有 wiki_nodes 跑一次 stat-vs-`last_flushed_mtime` 比对,有变化的直接调用 SyncUserNotesFromDisk 同步进 DB |
 | Boot reconcile 和 Watcher 注册之间的窗口 | main.go 是「先 reconcile,再 `wch.Watch(...)`」,两步都是 `WalkDir`,期间产生的文件变化两边都看不到,要等下一轮周期 reconcile 才补上 |
 | Reconciler 修改检测 | 仅靠 `(mtime, size)` 判 modify,`touch` / `cp -p` 等"内容变了但元数据不变"完全检测不到 |
 | 删 Root 目录后 wiki_node 残留 | 处理 fsnotify delete 只动 `file_index`,不动 `wiki_nodes`。删整个 Root 目录后,DB 留下一个孤儿 dirty 节点,WikiWriter 反复试写 ENOENT |
 | `mtime <= LastFlushedMtime` 判定 | 毫秒粒度下,用户编辑恰好和 WikiWriter 落盘同一毫秒 → 被当作自己的回声丢掉;低概率但非 0,网络 FS 更易触发 |
-| MessageBus 事件聚合 | 每条 `file_event` 单独 `bus.Publish("Wiki:RecentChanged")`,一次 `cp -r` 几千文件就是几千次 publish,没有 debounce / coalesce |
+| MessageBus 事件聚合 | **已修复 2026-05-20**:`ProcessBatch` 末尾按 `root_id` 去重发布,一次 batch 内每个 root 最多一次 `Wiki:RecentChanged` |
 | 内部接口 stub | `_internal/needs-summary` / `summary` / `index-status` 都返回 503,设计预留但 worker 接进来之前都用不了 |
 
 ### C. 设计与代码不一致(文档漂移)
@@ -309,8 +309,14 @@ go test -tags integration ./tests/...      # E2E (~10s,涉及 fsnotify)
 
 ### D. 修复优先级建议(我个人排序)
 
-1. **B 区第 1-3 项**:用户笔记会"莫名丢"是承诺打破最严重的情况,优先级最高。具体见上面的「下一步可以做什么」。
-2. **A 区第 1 项 `mirror` 模式**:要么实施,要么从 API + 错误信息里完全移除,别让用户以为有 fallback。
-3. **A 区第 5 项 `level='system'` 死代码**:如果不打算做三层,把 schema enum 收成 `{space, project}`,把 Render 里的 `Subwikis` 字段语义说清楚。
-4. **B 区第 8 项事件聚合**:在 Processor 出口加一个 100ms~1s 的聚合层,把 RecentChanged 按 root 合并。MessageBus 负载和 UI 体验都会显著好转。
-5. 剩下的(A 区其余、B 区其余):做到位才能让 NAS 真实负载下不踩坑,但优先级低于上面 4 条。
+**已完成(2026-05-20):**
+- ✅ B 区:WikiWriter ↔ reverse-sync 时序、服务停机期间外部编辑、事件聚合 → 修复(详见 `nimo_os_docs/docs/superpowers/plans/2026-05-20-wiki-reliability-fixes.md`)
+- ✅ A 区:`Wiki:RootEnabled` / `Wiki:RootDisabled` 事件 → 已实施
+
+**还要做的(按优先级):**
+
+1. **A 区第 1 项 `mirror` 模式**:要么实施,要么从 API + 错误信息里完全移除,别让用户以为有 fallback。
+2. **B 区第 1 项 `Watcher.SyncOut` 满了 drop**:这次没动,仍是 chan 容量 64 的丢任务路径 —— 一次性外部编辑高峰下仍会丢笔记。
+3. **A 区第 5 项 `level='system'` 死代码**:把 schema enum 收成 `{space, project}`,把 Render 里的 `Subwikis` 字段语义说清楚。
+4. **A 区第 2 项 inotify 上限检测降级**:大型 NAS 上的实际可靠性问题。
+5. 剩下的(reconciler 仅靠 (mtime,size)、删 root 目录后孤儿 wiki_node、`Wiki:PendingChanged`/`WriteFailed` 事件):优先级更低。

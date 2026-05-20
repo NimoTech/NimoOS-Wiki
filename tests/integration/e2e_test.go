@@ -13,6 +13,7 @@ import (
 
 	"github.com/NimoTech/NimoOS-Wiki/pkg/db"
 	"github.com/NimoTech/NimoOS-Wiki/pkg/ignore"
+	"github.com/NimoTech/NimoOS-Wiki/pkg/nodelock"
 	"github.com/NimoTech/NimoOS-Wiki/service/eventbus"
 	"github.com/NimoTech/NimoOS-Wiki/service/processor"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
@@ -63,10 +64,11 @@ func newHarness(t *testing.T) (*harness, context.CancelFunc) {
 	h.mgr = roots.NewManager(h.roots, h.nodes, bus)
 	h.rec = scanner.NewReconciler(h.files, h.events, ig)
 	h.watch = scanner.NewWatcher(h.events, h.nodes, ig, nil)
-	h.proc = processor.New(d, h.files, h.events, h.nodes, h.parse, bus, ig, nil, nil)
+	locks := nodelock.New()
+	h.proc = processor.New(d, h.files, h.events, h.nodes, h.parse, bus, ig, locks, nil)
 	h.proc.SyncIn = h.watch.SyncOut
 	// 0 debounce window so tests don't wait 5s
-	h.wri = writer.NewWriter(h.nodes, h.files, h.events, bus, nil, 0, nil)
+	h.wri = writer.NewWriter(h.nodes, h.files, h.events, bus, locks, 0, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	h.ctx = ctx
