@@ -63,7 +63,7 @@ func newHarness(t *testing.T) (*harness, context.CancelFunc) {
 	h.mgr = roots.NewManager(h.roots, h.nodes)
 	h.rec = scanner.NewReconciler(h.files, h.events, ig)
 	h.watch = scanner.NewWatcher(h.events, h.nodes, ig, nil)
-	h.proc = processor.New(d, h.files, h.events, h.nodes, h.parse, bus, ig, nil)
+	h.proc = processor.New(d, h.files, h.events, h.nodes, h.parse, bus, ig, nil, nil)
 	h.proc.SyncIn = h.watch.SyncOut
 	// 0 debounce window so tests don't wait 5s
 	h.wri = writer.NewWriter(h.nodes, h.files, h.events, bus, nil, 0, nil)

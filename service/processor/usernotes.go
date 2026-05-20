@@ -23,6 +23,9 @@ import (
 // If they differ, user_notes / etag / updated_at are written and a
 // Wiki:NodeUpdated event is published.
 func (p *EventProcessor) SyncUserNotesFromDisk(t scanner.UserNotesSyncTask) error {
+	unlock := p.locks.Lock(t.NodePath)
+	defer unlock()
+
 	data, err := os.ReadFile(t.WikiMDPath)
 	if err != nil {
 		return err

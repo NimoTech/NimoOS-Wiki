@@ -9,6 +9,7 @@ import (
 
 	"github.com/NimoTech/NimoOS-Wiki/common"
 	"github.com/NimoTech/NimoOS-Wiki/pkg/ignore"
+	"github.com/NimoTech/NimoOS-Wiki/pkg/nodelock"
 	"github.com/NimoTech/NimoOS-Wiki/pkg/pathutil"
 	"github.com/NimoTech/NimoOS-Wiki/service/eventbus"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
@@ -29,6 +30,7 @@ type EventProcessor struct {
 	parse  *repo.ParseStatusRepo
 	bus    eventbus.Bus
 	ig     *ignore.Matcher
+	locks  *nodelock.Locks
 	log    *zap.Logger
 
 	SyncIn <-chan scanner.UserNotesSyncTask
@@ -36,21 +38,33 @@ type EventProcessor struct {
 	EventDebounceMs int // default 200
 }
 
-// New constructs an EventProcessor. ig may be nil (in which case create events
-// never flag opaque); pass a real Matcher to propagate container-dir opacity
-// into file_index during Watcher-driven creates.
+// New constructs an EventProcessor.
+//
+// The `ig` parameter may be nil (in which case create events never flag
+// opaque); pass a real Matcher to propagate container-dir opacity into
+// file_index during Watcher-driven creates.
+//
+// The `locks` parameter is the shared per-path mutex set used to serialize
+// with WikiWriter.FlushOne on the same wiki node. Production callers MUST
+// pass the same *nodelock.Locks instance both services share (wired in
+// main.go). Passing nil falls back to a fresh local set — safe for tests,
+// broken in production.
 func New(d *sql.DB, files *repo.FileIndexRepo, events *repo.FileEventsRepo,
 	nodes *repo.WikiNodesRepo, parse *repo.ParseStatusRepo,
-	bus eventbus.Bus, ig *ignore.Matcher, log *zap.Logger) *EventProcessor {
+	bus eventbus.Bus, ig *ignore.Matcher, locks *nodelock.Locks,
+	log *zap.Logger) *EventProcessor {
 	if log == nil {
 		log = zap.NewNop()
 	}
 	if bus == nil {
 		bus = eventbus.Noop{}
 	}
+	if locks == nil {
+		locks = nodelock.New()
+	}
 	return &EventProcessor{
 		db: d, files: files, events: events, nodes: nodes, parse: parse,
-		bus: bus, ig: ig, log: log, EventDebounceMs: 200,
+		bus: bus, ig: ig, locks: locks, log: log, EventDebounceMs: 200,
 	}
 }
 
