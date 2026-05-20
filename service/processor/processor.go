@@ -93,14 +93,34 @@ func (p *EventProcessor) ProcessBatch(ctx context.Context) error {
 	pending := p.pairRenames(raw)
 	pending = p.debounce(pending, int64(p.EventDebounceMs))
 
+	// touched collects root_ids that had at least one successfully processed
+	// event in this batch. We dedup to publish exactly one RecentChanged per
+	// root regardless of batch size. NB: if process() returns an error we
+	// `continue` — that event's root is NOT added to touched, so a batch
+	// where every event for a root errors out yields no publish for that
+	// root. The events are still MarkProcessed below (no retry), so callers
+	// must not rely on RecentChanged for at-least-once delivery; treat it as
+	// a "something probably changed" hint.
+	touched := make(map[string]struct{}, 4)
 	for _, e := range pending {
 		if err := p.process(ctx, e); err != nil {
 			p.log.Warn("process event", zap.String("path", e.Path), zap.String("op", e.Op), zap.Error(err))
+			continue
 		}
+		touched[e.RootID] = struct{}{}
 	}
 
 	if err := p.events.MarkProcessed(allIDs, time.Now().UnixMilli()); err != nil {
 		return err
+	}
+
+	// Publish AFTER MarkProcessed so a publish failure can't cause re-
+	// processing. Trade-off: a crash between MarkProcessed and the loop
+	// below silently loses RecentChanged for this batch (events are already
+	// marked processed, no retry). For a UI "something changed" notification
+	// this is acceptable; subscribers should not rely on guaranteed delivery.
+	for rootID := range touched {
+		p.bus.Publish(common.EventRecentChanged, map[string]any{"root_id": rootID})
 	}
 	return nil
 }
@@ -122,18 +142,15 @@ func (p *EventProcessor) process(ctx context.Context, e repo.FileEvent) error {
 			_ = p.parse.InsertPending(e.Path)
 		}
 		p.markNearestWikiNodeDirty(e.Path)
-		p.bus.Publish(common.EventRecentChanged, map[string]any{"root_id": e.RootID})
 
 	case "modify":
 		p.markNearestWikiNodeDirty(e.Path)
-		p.bus.Publish(common.EventRecentChanged, map[string]any{"root_id": e.RootID})
 
 	case "delete":
 		if err := p.files.DeleteByPath(e.RootID, e.Path); err != nil {
 			return err
 		}
 		p.markNearestWikiNodeDirty(e.Path)
-		p.bus.Publish(common.EventRecentChanged, map[string]any{"root_id": e.RootID})
 
 	case "rename":
 		if e.RenameTo == "" {
@@ -142,7 +159,6 @@ func (p *EventProcessor) process(ctx context.Context, e repo.FileEvent) error {
 				return err
 			}
 			p.markNearestWikiNodeDirty(e.Path)
-			p.bus.Publish(common.EventRecentChanged, map[string]any{"root_id": e.RootID})
 			return nil
 		}
 		if !e.IsDir {
@@ -159,7 +175,6 @@ func (p *EventProcessor) process(ctx context.Context, e repo.FileEvent) error {
 			}
 			p.markNearestWikiNodeDirty(e.Path)
 			p.markNearestWikiNodeDirty(e.RenameTo)
-			p.bus.Publish(common.EventRecentChanged, map[string]any{"root_id": e.RootID})
 			return nil
 		}
 		// Directory rename → cascade UPDATE inside a single transaction
@@ -184,7 +199,6 @@ func (p *EventProcessor) process(ctx context.Context, e repo.FileEvent) error {
 		}
 		p.markNearestWikiNodeDirty(e.Path)
 		p.markNearestWikiNodeDirty(e.RenameTo)
-		p.bus.Publish(common.EventRecentChanged, map[string]any{"root_id": e.RootID})
 		p.bus.Publish(common.EventNodeUpdated, map[string]any{"path": e.RenameTo})
 	}
 	return nil

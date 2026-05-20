@@ -3,6 +3,7 @@ package processor
 import (
 	"context"
 	"database/sql"
+	"sync"
 	"testing"
 	"time"
 
@@ -173,4 +174,67 @@ func parentOf(p string) string {
 		}
 	}
 	return "/"
+}
+
+// fakeBus records publishes for test assertions.
+type fakeBus struct {
+	mu        sync.Mutex
+	publishes []struct {
+		Event   string
+		Payload any
+	}
+}
+
+func (f *fakeBus) Publish(ev string, payload any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.publishes = append(f.publishes, struct {
+		Event   string
+		Payload any
+	}{ev, payload})
+}
+func (f *fakeBus) Close() error { return nil }
+
+func (f *fakeBus) countOf(event string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, p := range f.publishes {
+		if p.Event == event {
+			n++
+		}
+	}
+	return n
+}
+
+func TestProcessor_RecentChangedAggregatedPerRoot(t *testing.T) {
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	files := repo.NewFileIndex(d)
+	events := repo.NewFileEvents(d)
+	nodes := repo.NewWikiNodes(d)
+	parse := repo.NewParseStatus(d)
+	bus := &fakeBus{}
+	p := New(d, files, events, nodes, parse, bus, nil, nil, nil)
+
+	now := time.Now().UnixMilli()
+	// 5 modifies on the same root + 3 on a second root within one batch
+	for i := 0; i < 5; i++ {
+		require.NoError(t, events.Insert(repo.FileEvent{
+			ID: repo.NewID(), RootID: "rA", Path: "/a/" + string(rune('a'+i)) + ".txt",
+			Op: "modify", DetectedAt: now + int64(i),
+		}))
+	}
+	for i := 0; i < 3; i++ {
+		require.NoError(t, events.Insert(repo.FileEvent{
+			ID: repo.NewID(), RootID: "rB", Path: "/b/" + string(rune('a'+i)) + ".txt",
+			Op: "modify", DetectedAt: now + int64(100+i),
+		}))
+	}
+
+	require.NoError(t, p.ProcessBatch(context.Background()))
+
+	require.Equal(t, 2, bus.countOf("Wiki:RecentChanged"),
+		"exactly one RecentChanged per distinct root_id")
 }
