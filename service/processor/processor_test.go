@@ -25,6 +25,8 @@ func setup(t *testing.T) (*EventProcessor, *repo.FileIndexRepo, *repo.FileEvents
 	return p, files, events, nodes, d
 }
 
+func strPtr(s string) *string { return &s }
+
 func TestProcessor_DebounceCoalesces(t *testing.T) {
 	p, _, events, _, _ := setup(t)
 	now := time.Now().UnixMilli()
