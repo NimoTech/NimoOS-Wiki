@@ -107,6 +107,13 @@ func main() {
 		zapLog.Warn("boot reconcile failed (non-fatal)", zap.Error(err))
 	}
 
+	// Boot user-notes sync: pull in any .wiki.md edits the user made while the
+	// service was stopped. Must run BEFORE watchers are registered so the live
+	// path doesn't race with the disk-vs-DB comparison.
+	if err := bootSyncWikiMD(rRoots, proc); err != nil {
+		zapLog.Warn("boot user-notes sync failed (non-fatal)", zap.Error(err))
+	}
+
 	// Register watchers for each enabled root
 	for _, root := range listEnabled(rRoots) {
 		if root.WatchMode == "auto" {
@@ -202,6 +209,34 @@ func bootReconcile(ctx context.Context, r *repo.WikiRootsRepo, rec *scanner.Reco
 			continue
 		}
 		_ = r.UpdateLastScanAt(root.ID, time.Now().UnixMilli())
+	}
+	return nil
+}
+
+// bootSyncWikiMD reconciles on-disk `.wiki.md` against wiki_nodes at startup,
+// so edits made while the service was down don't get clobbered by the first
+// WikiWriter flush. Non-fatal: a failure on one root logs and continues.
+func bootSyncWikiMD(r *repo.WikiRootsRepo, proc *processor.EventProcessor) error {
+	all, err := r.List()
+	if err != nil {
+		return err
+	}
+	for _, root := range all {
+		if !root.Enabled {
+			continue
+		}
+		n, err := proc.BootSyncRoot(root.ID)
+		if err != nil {
+			zapLog.Warn("boot user-notes sync root failed",
+				zap.String("root_id", root.ID),
+				zap.String("path", root.Path), zap.Error(err))
+			continue
+		}
+		if n > 0 {
+			zapLog.Info("boot user-notes sync",
+				zap.String("root_id", root.ID),
+				zap.String("path", root.Path), zap.Int("synced", n))
+		}
 	}
 	return nil
 }
