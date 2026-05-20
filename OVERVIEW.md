@@ -41,7 +41,7 @@ Wiki 只做**导航地图**;**内容搜索**(向量库 / 全文索引)是接下�
 
 ## API 路由 (`/v1/wiki`)
 
-所有路由强制 JWT (无 localhost 豁免,匹配 AI 服务的安全策略)。`_internal` 组例外:仅监听 localhost,不通过 Gateway 暴露。
+所有公开路由走 JWT 中间件,**localhost 来源豁免**(由 `RealIP` 判断,Gateway 转发的外部请求 RealIP 已被改写为真实客户端 IP,不命中本机分支)。这是 2026-05-14 Agent 集成时为了让 Python Agent 直连而引入的策略,与 Photos 服务同模式。`_internal` 组例外:`LocalhostOnly` 中间件强制 RealIP=loopback,即便经 Gateway 也访问不到。
 
 ### A 组 — Root 管理
 
@@ -53,7 +53,9 @@ Wiki 只做**导航地图**;**内容搜索**(向量库 / 全文索引)是接下�
 | POST | `/v1/wiki/roots/:id/rescan` | 强制对账扫描(把 last_scan_at 清零) |
 | GET | `/v1/wiki/candidates` | 枚举 LocalStorage 上报的挂载点候选 |
 
-启用 Root 时做**写测试**(在路径下创建并删除 `.nimoos-wiki-write-test`);失败返回 409,提示用户改用 `storage_mode=mirror`。
+启用 Root 时做**写测试**(在路径下创建并删除 `.nimoos-wiki-write-test`);失败返回 409。
+
+> ⚠ `storage_mode=mirror` **当前未实现**。`POST /roots` 接受这个字段、`wiki_roots.storage_mode` 也存了下来,但 `WikiWriter` 始终把 `.wiki.md` 写到 `nodePath/.wiki.md`,不会路由到 `/var/lib/nimoos/wiki/mirror/<root_id>/...`。在不可写路径上目前没有替代方案,只能放弃注册或在用户层先把目录改成可写。该缺口列在下面的「实施现状」一节。
 
 ### B 组 — Wiki 内容
 
@@ -63,7 +65,7 @@ Wiki 只做**导航地图**;**内容搜索**(向量库 / 全文索引)是接下�
 | GET | `/v1/wiki/node?path=...` | 读单节点(结构化 JSON,含 etag) |
 | GET | `/v1/wiki/raw?path=...` | 读原始 `.wiki.md` 文本 |
 | PUT | `/v1/wiki/user-notes?path=...` | 写 User Notes,需 `If-Match: <etag>` 乐观锁 |
-| GET | `/v1/wiki/recent-changes?root_id=&limit=` | 跨 Root 拉最近变化 |
+| GET | `/v1/wiki/recent-changes?root_id=&since_ms=&limit=` | 跨 Root 拉最近变化(`since_ms` 是游标,`limit` 默认 50、上限 200) |
 
 ### C 组 — 内部接口(localhost only, 不注册到 Gateway)
 
@@ -76,11 +78,13 @@ Wiki 只做**导航地图**;**内容搜索**(向量库 / 全文索引)是接下�
 
 ### MessageBus 事件
 
-- `Wiki:NodeUpdated` — `{path, root_id}`,节点落盘后
-- `Wiki:RecentChanged` — `{root_id}`,新事件入库后
-- `Wiki:PendingChanged` — `{root_id, pending_count}`
-- `Wiki:RootEnabled` / `Wiki:RootDisabled`
-- `Wiki:WriteFailed` — WikiWriter 连续 5 次失败后告警
+| 事件 | 实施状态 | 备注 |
+|---|---|---|
+| `Wiki:NodeUpdated` | ✅ 已发 | 节点落盘后,`{path, root_id}` |
+| `Wiki:RecentChanged` | ✅ 已发(**每条事件都发一次,无节流**) | `{root_id}`,大批量文件操作会形成同等数量的 publish,见「实施现状 #2」 |
+| `Wiki:PendingChanged` | ❌ 未发 | spec 里规划的事件,代码里没人发送 |
+| `Wiki:RootEnabled` / `Wiki:RootDisabled` | ❌ 未发 | 同上,设计有、代码无 |
+| `Wiki:WriteFailed` | ❌ 未发 | spec 设想连续 5 次失败告警,代码只是记日志 |
 
 ---
 
@@ -113,11 +117,17 @@ SQLite 数据库 `/var/lib/nimoos/wiki/wiki.db` (CGO_ENABLED=1)。所有时间�
 
 | 表 | 用途 |
 |---|---|
-| `wiki_roots` | 已注册的 Root:path / level / watch_mode / storage_mode / enabled / scan_interval_s |
-| `wiki_nodes` | 每个有 `.wiki.md` 的目录一行。**`user_notes` 内容直接存这里**,DB 是权威源,`.wiki.md` 是渲染产物;`last_flushed_mtime` 用于 Watcher 区分「自己写的」vs「外部编辑」 |
+| `wiki_roots` | 已注册的 Root:path / level / watch_mode / storage_mode / enabled / scan_interval_s。每行由 `POST /v1/wiki/roots` 写入 |
+| `wiki_nodes` | **每行对应一个被显式注册的 Root**(并且**仅由 Root 注册时 seed**,见下方说明)。`user_notes` 内容直接存这里,DB 是权威源,`.wiki.md` 是渲染产物;`last_flushed_mtime` 用于 Watcher 区分「自己写的」vs「外部编辑」 |
 | `file_index` | 监控范围内的所有文件 + 容器目录占位条目;Reconciler 对账用。`is_opaque=1` 标记容器目录(node_modules 等),内部不递归 |
 | `file_events` | 统一的文件事件表(合并旧设计中的 pending_events + recent_changes)。三种消费模式:`processed_at IS NULL` 队列、`since=` 增量查询、`ORDER BY detected_at DESC` 最近变化渲染 |
 | `parse_status` | 给将来的 Parser worker 上报解析/索引状态;本服务只在 create 事件时入库 `pending`,不读 |
+
+**关于 wiki_node 的产生(很容易踩坑的点):**
+
+`wiki_nodes` 表里**只有**通过 `POST /v1/wiki/roots` 显式注册过的目录会有一行。代码里整个仓库唯一插入 `wiki_nodes` 的位置是 `service/roots/manager.go:Create`(seed root 节点)。Processor 的 `markNearestWikiNodeDirty` 是**向上**找最近的现存 wiki_node 来标脏,**从不**自动给子目录建节点。
+
+也就是说:Wiki 是「用户登记几个 Root,就长几个 wiki_node」—— 不是文件树的镜像。要给 `/DATA` 当 space、`/DATA/Projects/nimoos` 当 project,这两个 Root 都得分别 POST 一次。schema 里 `wiki_nodes.level` 留了 `system`/`space`/`project` 三档,但**`system` 单例节点(root_id=NULL)在代码里没有任何 seed 路径**,实际跑起来只用到 `space` 和 `project` 两档。Agent 集成里的「地图」也只渲染两层。
 
 **关键正确性不变量:**
 
@@ -134,14 +144,13 @@ SQLite 数据库 `/var/lib/nimoos/wiki/wiki.db` (CGO_ENABLED=1)。所有时间�
 /etc/nimoos/wiki.conf              配置(INI,样例随包安装)
 /var/lib/nimoos/wiki/
   └── wiki.db                      SQLite (WAL 模式)
-  └── mirror/<root_id>/...         mirror 模式下落盘的 .wiki.md
 /var/run/nimoos/
   ├── wiki.url                     服务发现地址
   └── wiki.pid                     systemd PID 文件
 /var/log/nimoos/nimoos-wiki.log    zap 日志
 ```
 
-各启用 Root 下的 `<root>/.wiki.md` (inline 模式) 或 `mirror/...` (mirror 模式)。
+`.wiki.md` 始终落在对应 wiki_node 的 `<root>/.wiki.md`(inline 模式)。spec 里规划的 `mirror/<root_id>/...` 目录布局**当前未实现**,见「实施现状」。
 
 ---
 
@@ -257,3 +266,51 @@ go test -tags integration ./tests/...      # E2E (~10s,涉及 fsnotify)
 3. **跨 Root 软链接** — 当前不跟随,目标若在另一个 Root 内由那个 Root 自行扫描。
 4. **NFS/CIFS 上的事件可靠性** — 自动降级为 `scan_only`,延迟取决于 `ScanIntervalSec`。
 5. **UI** — 当前没有前端,所有交互通过 API。
+
+---
+
+## 实施现状 vs 设计 spec(2026-05-20 对齐)
+
+为避免文档与代码漂移误导读者,这里把「设计有、代码没做(或做了一半)」的差异统一列出。修复优先级仅供参考。
+
+### A. 设计有,代码完全没实现
+
+| 项 | spec 来源 | 当前代码行为 | 影响 |
+|---|---|---|---|
+| `storage_mode=mirror` | 2026-05-13 §5(line 317)、§8.1 | `WikiWriter` 始终写 `<root>/.wiki.md`,无 mirror 分支 | 不可写 Root 没有 fallback;写测试失败的提示信息在骗用户 |
+| inotify watch 上限检测降级 | 2026-05-13 §9 line 577 | 没有读 `/proc/sys/fs/inotify/max_user_watches`,触顶时只能静默丢 watch | 大型 NAS 上部分目录失去实时事件,只能靠 6h 周期 reconcile 兜底 |
+| `Wiki:PendingChanged` / `Wiki:RootEnabled` / `Wiki:RootDisabled` / `Wiki:WriteFailed` 事件 | 2026-05-13 §7.4 | 完全没人 publish | UI / 监控拿不到这些信号 |
+| Root 路径运行时消失自动标 `enabled=0` | 2026-05-13 §9 line 574 | Watcher 报错只记日志,不动 `enabled` | 拔盘后 wiki_root 仍是 enabled,反复试写失败 |
+| `wiki_nodes.level='system'` 单例顶层节点 | 2026-05-13 §4.1 schema | 无任何 seed 路径,完全死代码 | 实际只有两层(space / project),三层结构是假的 |
+| 用户手编 system 区后备份到 user-notes 上方 | 2026-05-13 §9 line 576 | WikiWriter 不读现有文件,被破坏的 system 区直接被下次 flush 覆盖,无备份 | 用户手贱在 system 区写的东西会无声丢失 |
+| inotify cookie / 跨 watch 的 rename 跟踪 | 2026-05-13 §6.1 末段 | EventProcessor 用 1s 时间窗口做 best-effort 配对,失败退化为 delete | 跨 watch 的 mv 会丢前缀级联,变成两个独立的 delete+create |
+
+### B. 设计有,代码部分实现 / 有逻辑漏洞
+
+| 项 | 当前缺陷 |
+|---|---|
+| user-notes 反向同步 | `Watcher.SyncOut` chan 容量 64,满了 `default` 丢弃 → 一次外部编辑事件丢了之后,这次编辑的笔记永远进不了 DB,得等用户再改一次 |
+| WikiWriter ↔ reverse-sync 之间的 user_notes 时序 | spec §6.5 强调了 mtime + DB commit 的顺序,但**没**把"读 user_notes → 渲染 → 写盘"和"反向同步写 user_notes"放进同一事务。两条流程都是独立 goroutine,理论上 WikiWriter 可能用 stale user_notes 覆盖盘上更新的内容 |
+| 服务停机期间 `.wiki.md` 的外部编辑 | spec §6.3 要求 boot 跑 reconciler 兜底,但 reconciler 不索引 `.wiki.md`(它是输出,不入 file_index)→ 停机期间的编辑既没被 reconciler 发现,也不会触发 fsnotify(因为没有运行时事件源)→ 静默丢失 |
+| Boot reconcile 和 Watcher 注册之间的窗口 | main.go 是「先 reconcile,再 `wch.Watch(...)`」,两步都是 `WalkDir`,期间产生的文件变化两边都看不到,要等下一轮周期 reconcile 才补上 |
+| Reconciler 修改检测 | 仅靠 `(mtime, size)` 判 modify,`touch` / `cp -p` 等"内容变了但元数据不变"完全检测不到 |
+| 删 Root 目录后 wiki_node 残留 | 处理 fsnotify delete 只动 `file_index`,不动 `wiki_nodes`。删整个 Root 目录后,DB 留下一个孤儿 dirty 节点,WikiWriter 反复试写 ENOENT |
+| `mtime <= LastFlushedMtime` 判定 | 毫秒粒度下,用户编辑恰好和 WikiWriter 落盘同一毫秒 → 被当作自己的回声丢掉;低概率但非 0,网络 FS 更易触发 |
+| MessageBus 事件聚合 | 每条 `file_event` 单独 `bus.Publish("Wiki:RecentChanged")`,一次 `cp -r` 几千文件就是几千次 publish,没有 debounce / coalesce |
+| 内部接口 stub | `_internal/needs-summary` / `summary` / `index-status` 都返回 503,设计预留但 worker 接进来之前都用不了 |
+
+### C. 设计与代码不一致(文档漂移)
+
+| 项 | 旧设计 | 当前代码 |
+|---|---|---|
+| JWT 中间件 | 2026-05-13 §7 写"所有路由强制 JWT" | 2026-05-14 v2 design §4.2 改成 localhost 豁免 + 信任 `X-NimoOS-User-ID`,**代码按 v2 跑** —— 本文档已修正 |
+| `recent-changes` 查询参数 | 旧描述只有 `root_id` + `limit` | 代码支持 `since_ms` 游标,2026-05-14 v2 design §4.5 加的 —— 本文档已修正 |
+| Subwikis 语义 | spec `/node` 响应里有 `subwikis` 字段,设计语境暗示是嵌套 wiki 结构 | 实际是按 path 直接前缀找**当前 wiki_nodes 表里恰好是它直系下一级的**节点,跨级 Root(如 `/DATA` 和 `/DATA/Projects/nimoos`,中间没注册 `/DATA/Projects`)不会互相挂上 |
+
+### D. 修复优先级建议(我个人排序)
+
+1. **B 区第 1-3 项**:用户笔记会"莫名丢"是承诺打破最严重的情况,优先级最高。具体见上面的「下一步可以做什么」。
+2. **A 区第 1 项 `mirror` 模式**:要么实施,要么从 API + 错误信息里完全移除,别让用户以为有 fallback。
+3. **A 区第 5 项 `level='system'` 死代码**:如果不打算做三层,把 schema enum 收成 `{space, project}`,把 Render 里的 `Subwikis` 字段语义说清楚。
+4. **B 区第 8 项事件聚合**:在 Processor 出口加一个 100ms~1s 的聚合层,把 RecentChanged 按 root 合并。MessageBus 负载和 UI 体验都会显著好转。
+5. 剩下的(A 区其余、B 区其余):做到位才能让 NAS 真实负载下不踩坑,但优先级低于上面 4 条。
