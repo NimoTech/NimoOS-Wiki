@@ -9,6 +9,7 @@ import (
 
 	"github.com/NimoTech/NimoOS-Wiki/common"
 	"github.com/NimoTech/NimoOS-Wiki/pkg/childmap"
+	"github.com/NimoTech/NimoOS-Wiki/pkg/nodelock"
 	"github.com/NimoTech/NimoOS-Wiki/pkg/wikimd"
 	"github.com/NimoTech/NimoOS-Wiki/service/eventbus"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
@@ -33,13 +34,19 @@ type Writer struct {
 	files              *repo.FileIndexRepo
 	events             *repo.FileEventsRepo
 	bus                eventbus.Bus
+	locks              *nodelock.Locks
 	debounceWindow     time.Duration
 	aggregateThreshold int
 	log                *zap.Logger
 }
 
+// NewWriter constructs a Writer. The `locks` parameter is the shared per-path
+// mutex set used to serialize with EventProcessor.SyncUserNotesFromDisk on
+// the same wiki node. Production callers MUST pass the same *nodelock.Locks
+// instance both services share (wired in main.go). Passing nil falls back to
+// a fresh local set — safe for tests, broken in production.
 func NewWriter(nodes *repo.WikiNodesRepo, files *repo.FileIndexRepo,
-	events *repo.FileEventsRepo, bus eventbus.Bus,
+	events *repo.FileEventsRepo, bus eventbus.Bus, locks *nodelock.Locks,
 	debounceWindow time.Duration, log *zap.Logger) *Writer {
 	if log == nil {
 		log = zap.NewNop()
@@ -47,14 +54,20 @@ func NewWriter(nodes *repo.WikiNodesRepo, files *repo.FileIndexRepo,
 	if bus == nil {
 		bus = eventbus.Noop{}
 	}
+	if locks == nil {
+		locks = nodelock.New()
+	}
 	return &Writer{
-		nodes: nodes, files: files, events: events, bus: bus,
+		nodes: nodes, files: files, events: events, bus: bus, locks: locks,
 		debounceWindow: debounceWindow, aggregateThreshold: 50, log: log,
 	}
 }
 
 // FlushOne renders + writes one node's .wiki.md.
 func (w *Writer) FlushOne(nodePath string) error {
+	unlock := w.locks.Lock(nodePath)
+	defer unlock()
+
 	node, err := w.nodes.Get(nodePath)
 	if err != nil {
 		return err

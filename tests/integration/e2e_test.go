@@ -66,7 +66,7 @@ func newHarness(t *testing.T) (*harness, context.CancelFunc) {
 	h.proc = processor.New(d, h.files, h.events, h.nodes, h.parse, bus, ig, nil)
 	h.proc.SyncIn = h.watch.SyncOut
 	// 0 debounce window so tests don't wait 5s
-	h.wri = writer.NewWriter(h.nodes, h.files, h.events, bus, 0, nil)
+	h.wri = writer.NewWriter(h.nodes, h.files, h.events, bus, nil, 0, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	h.ctx = ctx

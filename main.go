@@ -100,6 +100,7 @@ func main() {
 		proc.EventDebounceMs = config.Cfg.EventDebounceMs
 	}
 	wri := writer.NewWriter(rNodes, rFiles, rEvents, bus,
+		nil, // TODO(Task7): replace with shared nodelock.Locks
 		time.Duration(config.Cfg.WikiWriteDebounceSec)*time.Second, zapLog)
 
 	// Boot reconcile: replay drift BEFORE accepting traffic / starting watchers.

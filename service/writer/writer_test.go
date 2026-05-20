@@ -19,7 +19,7 @@ func setupWriter(t *testing.T) (*Writer, *repo.WikiNodesRepo, *repo.FileIndexRep
 	nodes := repo.NewWikiNodes(d)
 	files := repo.NewFileIndex(d)
 	events := repo.NewFileEvents(d)
-	w := NewWriter(nodes, files, events, nil, 0, nil)
+	w := NewWriter(nodes, files, events, nil, nil, 0, nil)
 	return w, nodes, files, events
 }
 
@@ -50,7 +50,7 @@ func TestWriter_DebounceSkipsRecentFlush(t *testing.T) {
 	require.NoError(t, err)
 	defer d.Close()
 	nodes := repo.NewWikiNodes(d)
-	w := NewWriter(nodes, repo.NewFileIndex(d), repo.NewFileEvents(d), nil, 5*time.Second, nil)
+	w := NewWriter(nodes, repo.NewFileIndex(d), repo.NewFileEvents(d), nil, nil, 5*time.Second, nil)
 
 	tmp := t.TempDir()
 	now := time.Now().UnixMilli()
