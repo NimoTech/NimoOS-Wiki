@@ -10,12 +10,19 @@ import (
 	"github.com/NimoTech/NimoOS-Wiki/service/scanner"
 )
 
-// runUserNotesSync handles a UserNotesSyncTask emitted by the Watcher when
-// it detects an external edit to a .wiki.md file (e.g., user typed in SMB).
-// Extracts the user-notes block from the file and writes it to the DB.
-// If the file's user-notes equal what's already in DB, only refresh the
-// LastFlushedMtime so we don't keep retriggering on the same edit.
-func (p *EventProcessor) runUserNotesSync(t scanner.UserNotesSyncTask) error {
+// SyncUserNotesFromDisk pulls a node's user-notes from the on-disk .wiki.md
+// into the database. Called from two places:
+//
+//   - EventProcessor.Run, when the Watcher detects an external edit
+//     (the .wiki.md mtime advanced past wiki_nodes.last_flushed_mtime).
+//   - main.go at startup, to recover edits made while the service was down.
+//
+// Preconditions: t.WikiMDPath must be a readable file, t.NodePath must be an
+// existing wiki_nodes row. If the file's user-notes match what's already in
+// the DB, only last_flushed_mtime is bumped (suppresses repeat sync triggers).
+// If they differ, user_notes / etag / updated_at are written and a
+// Wiki:NodeUpdated event is published.
+func (p *EventProcessor) SyncUserNotesFromDisk(t scanner.UserNotesSyncTask) error {
 	data, err := os.ReadFile(t.WikiMDPath)
 	if err != nil {
 		return err

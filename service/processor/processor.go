@@ -280,7 +280,7 @@ func (p *EventProcessor) Run(ctx context.Context, tickEvery time.Duration) {
 				p.log.Warn("ProcessBatch", zap.Error(err))
 			}
 		case task := <-p.SyncIn:
-			if err := p.runUserNotesSync(task); err != nil {
+			if err := p.SyncUserNotesFromDisk(task); err != nil {
 				p.log.Warn("user-notes sync", zap.String("path", task.NodePath), zap.Error(err))
 			}
 		}
