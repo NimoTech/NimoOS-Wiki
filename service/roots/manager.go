@@ -10,16 +10,22 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NimoTech/NimoOS-Wiki/common"
+	"github.com/NimoTech/NimoOS-Wiki/service/eventbus"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
 )
 
 type Manager struct {
 	roots *repo.WikiRootsRepo
 	nodes *repo.WikiNodesRepo
+	bus   eventbus.Bus
 }
 
-func NewManager(roots *repo.WikiRootsRepo, nodes *repo.WikiNodesRepo) *Manager {
-	return &Manager{roots: roots, nodes: nodes}
+func NewManager(roots *repo.WikiRootsRepo, nodes *repo.WikiNodesRepo, bus eventbus.Bus) *Manager {
+	if bus == nil {
+		bus = eventbus.Noop{}
+	}
+	return &Manager{roots: roots, nodes: nodes, bus: bus}
 }
 
 type CreateArgs struct {
@@ -109,6 +115,12 @@ func (m *Manager) Create(args CreateArgs) (string, error) {
 		Level: args.Level, Dirty: true, UpdatedAt: now,
 	})
 
+	m.bus.Publish(common.EventRootEnabled, map[string]any{
+		"root_id": id,
+		"path":    args.Path,
+		"level":   args.Level,
+	})
+
 	return id, nil
 }
 
@@ -127,13 +139,21 @@ func (m *Manager) Delete(id string, purgeFiles bool) error {
 		}
 	}
 
-	// Delete wiki_nodes for this Root
 	nodes, _ := m.nodes.List(id)
 	for _, n := range nodes {
 		_ = m.nodes.Delete(n.Path)
 	}
-	_ = root // (kept for future use; no need to reference further)
-	return m.roots.Delete(id)
+
+	if err := m.roots.Delete(id); err != nil {
+		return err
+	}
+
+	m.bus.Publish(common.EventRootDisabled, map[string]any{
+		"root_id": id,
+		"path":    root.Path,
+		"level":   root.Level,
+	})
+	return nil
 }
 
 // Rescan touches last_scan_at to 0 so the next reconciler tick treats this

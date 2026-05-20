@@ -3,12 +3,36 @@ package roots
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/NimoTech/NimoOS-Wiki/pkg/db"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
 	"github.com/stretchr/testify/require"
 )
+
+type fakeBus struct {
+	mu        sync.Mutex
+	publishes []struct{ Event string }
+}
+
+func (f *fakeBus) Publish(ev string, _ any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.publishes = append(f.publishes, struct{ Event string }{ev})
+}
+func (f *fakeBus) Close() error { return nil }
+func (f *fakeBus) countOf(event string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, p := range f.publishes {
+		if p.Event == event {
+			n++
+		}
+	}
+	return n
+}
 
 func setupManager(t *testing.T) (*Manager, *repo.WikiRootsRepo) {
 	t.Helper()
@@ -17,7 +41,7 @@ func setupManager(t *testing.T) (*Manager, *repo.WikiRootsRepo) {
 	t.Cleanup(func() { _ = d.Close() })
 	roots := repo.NewWikiRoots(d)
 	nodes := repo.NewWikiNodes(d)
-	return NewManager(roots, nodes), roots
+	return NewManager(roots, nodes, &fakeBus{}), roots
 }
 
 func TestCreate_WritableInlineSucceeds(t *testing.T) {
@@ -121,4 +145,33 @@ func TestDetectFSType_ReturnsString(t *testing.T) {
 	// Just sanity — should return something non-empty for "/"
 	s := DetectFSType("/")
 	require.NotEmpty(t, s)
+}
+
+func TestManager_PublishesRootEnabledOnCreate(t *testing.T) {
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	bus := &fakeBus{}
+	mgr := NewManager(repo.NewWikiRoots(d), repo.NewWikiNodes(d), bus)
+
+	tmp := t.TempDir()
+	id, err := mgr.Create(CreateArgs{Path: tmp, Level: "project"})
+	require.NoError(t, err)
+	require.NotEmpty(t, id)
+	require.Equal(t, 1, bus.countOf("Wiki:RootEnabled"))
+}
+
+func TestManager_PublishesRootDisabledOnDelete(t *testing.T) {
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	bus := &fakeBus{}
+	mgr := NewManager(repo.NewWikiRoots(d), repo.NewWikiNodes(d), bus)
+
+	tmp := t.TempDir()
+	id, err := mgr.Create(CreateArgs{Path: tmp, Level: "project"})
+	require.NoError(t, err)
+
+	require.NoError(t, mgr.Delete(id, false))
+	require.Equal(t, 1, bus.countOf("Wiki:RootDisabled"))
 }

@@ -93,7 +93,7 @@ func main() {
 	bus := eventbus.New(config.Cfg.RuntimePath)
 	ig := ignore.New(config.Cfg.ContainerDirs)
 	locks := nodelock.New()
-	mgr := roots.NewManager(rRoots, rNodes)
+	mgr := roots.NewManager(rRoots, rNodes, bus)
 	rec := scanner.NewReconciler(rFiles, rEvents, ig)
 	wch := scanner.NewWatcher(rEvents, rNodes, ig, zapLog)
 	proc := processor.New(d, rFiles, rEvents, rNodes, rParse, bus, ig, locks, zapLog)
