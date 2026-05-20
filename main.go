@@ -21,6 +21,7 @@ import (
 	"github.com/NimoTech/NimoOS-Wiki/pkg/config"
 	"github.com/NimoTech/NimoOS-Wiki/pkg/db"
 	"github.com/NimoTech/NimoOS-Wiki/pkg/ignore"
+	"github.com/NimoTech/NimoOS-Wiki/pkg/nodelock"
 	v1 "github.com/NimoTech/NimoOS-Wiki/route/v1"
 	"github.com/NimoTech/NimoOS-Wiki/service/eventbus"
 	"github.com/NimoTech/NimoOS-Wiki/service/processor"
@@ -91,18 +92,16 @@ func main() {
 	// Services
 	bus := eventbus.New(config.Cfg.RuntimePath)
 	ig := ignore.New(config.Cfg.ContainerDirs)
+	locks := nodelock.New()
 	mgr := roots.NewManager(rRoots, rNodes)
 	rec := scanner.NewReconciler(rFiles, rEvents, ig)
 	wch := scanner.NewWatcher(rEvents, rNodes, ig, zapLog)
-	proc := processor.New(d, rFiles, rEvents, rNodes, rParse, bus, ig,
-		nil, // TODO(Task7): replace with shared nodelock.Locks
-		zapLog)
+	proc := processor.New(d, rFiles, rEvents, rNodes, rParse, bus, ig, locks, zapLog)
 	proc.SyncIn = wch.SyncOut
 	if config.Cfg.EventDebounceMs > 0 {
 		proc.EventDebounceMs = config.Cfg.EventDebounceMs
 	}
-	wri := writer.NewWriter(rNodes, rFiles, rEvents, bus,
-		nil, // TODO(Task7): replace with shared nodelock.Locks
+	wri := writer.NewWriter(rNodes, rFiles, rEvents, bus, locks,
 		time.Duration(config.Cfg.WikiWriteDebounceSec)*time.Second, zapLog)
 
 	// Boot reconcile: replay drift BEFORE accepting traffic / starting watchers.
