@@ -88,6 +88,7 @@ func main() {
 	rFiles := repo.NewFileIndex(d)
 	rEvents := repo.NewFileEvents(d)
 	rParse := repo.NewParseStatus(d)
+	rSummaries := repo.NewWikiSummaries(d)
 
 	// Services
 	bus := eventbus.New(config.Cfg.RuntimePath)
@@ -162,6 +163,7 @@ func main() {
 		Nodes:       rNodes,
 		Files:       rFiles,
 		Events:      rEvents,
+		Summaries:   rSummaries,
 		RuntimePath: config.Cfg.RuntimePath,
 	})
 

@@ -16,6 +16,26 @@ func stubServiceUnavailable(c echo.Context) error {
 		"endpoint not yet implemented; reserved for future Parser/Summary worker")
 }
 
+func getInternalNeedsSummary(d Deps) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		limit, _ := strconv.Atoi(c.QueryParam("limit"))
+		if limit <= 0 {
+			limit = 10
+		}
+		if limit > 50 {
+			limit = 50
+		}
+		nodes, err := d.Summaries.ListNeedsSummary(limit)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+		if nodes == nil {
+			nodes = []repo.NeedsSummaryRow{}
+		}
+		return c.JSON(http.StatusOK, map[string]any{"nodes": nodes})
+	}
+}
+
 func getInternalFileEvents(d Deps) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		rootID := c.QueryParam("root_id")

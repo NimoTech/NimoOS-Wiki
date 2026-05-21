@@ -28,6 +28,7 @@ func setupTestRouter(t *testing.T) (Deps, *echo.Echo) {
 		Nodes:     repo.NewWikiNodes(d),
 		Files:     repo.NewFileIndex(d),
 		Events:    repo.NewFileEvents(d),
+		Summaries: repo.NewWikiSummaries(d),
 	}
 	// Bypass JWT for tests: build a minimal echo with the public group sans JWT.
 	e := echo.New()

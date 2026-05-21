@@ -17,6 +17,7 @@ type Deps struct {
 	Nodes       *repo.WikiNodesRepo
 	Files       *repo.FileIndexRepo
 	Events      *repo.FileEventsRepo
+	Summaries   *repo.WikiSummariesRepo
 	RuntimePath string
 }
 
@@ -47,7 +48,7 @@ func InitRouter(d Deps) *echo.Echo {
 
 	// C: internal — no JWT, localhost only.
 	i := e.Group("/v1/wiki/_internal", route.LocalhostOnly)
-	i.GET("/needs-summary", stubServiceUnavailable)
+	i.GET("/needs-summary", getInternalNeedsSummary(d))
 	i.POST("/summary", stubServiceUnavailable)
 	i.GET("/file-events", getInternalFileEvents(d))
 	i.POST("/index-status", stubServiceUnavailable)
