@@ -3,6 +3,8 @@ package repo
 import (
 	"database/sql"
 	"errors"
+	"fmt"
+	"strings"
 )
 
 type FileIndexRepo struct{ db *sql.DB }
@@ -86,6 +88,130 @@ func (r *FileIndexRepo) ListAllByRoot(rootID string) ([]FileIndex, error) {
 func (r *FileIndexRepo) DeleteByPath(rootID, path string) error {
 	_, err := r.db.Exec(`DELETE FROM file_index WHERE root_id = ? AND path = ?`, rootID, path)
 	return err
+}
+
+var evidenceTextExts = []string{
+	"md", "txt", "json", "csv", "yaml", "yml", "toml", "ini",
+	"go", "py", "ts", "tsx", "js", "rs", "java", "c", "h", "cpp", "sh", "sql",
+}
+
+// ListEvidenceTextFiles returns up to `limit` text-class files under
+// nodePath (inclusive of subtree), each with size ≤ maxBytes, sorted by
+// most-recent mtime first. Opaque container subtrees are not indexed in
+// file_index so they're naturally excluded.
+func (r *FileIndexRepo) ListEvidenceTextFiles(rootID, nodePath string, limit int, maxBytes int64) ([]FileIndex, error) {
+	pattern := EscapeLikeArg(nodePath) + `/%`
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(evidenceTextExts)), ",")
+	args := []any{rootID, nodePath, pattern, maxBytes}
+	for _, e := range evidenceTextExts {
+		args = append(args, e)
+	}
+	args = append(args, limit)
+
+	q := fmt.Sprintf(`SELECT `+fileIndexCols+` FROM file_index
+		WHERE root_id = ?
+		  AND (path = ? OR path LIKE ? ESCAPE '\')
+		  AND is_dir = 0
+		  AND is_opaque = 0
+		  AND status = 'present'
+		  AND COALESCE(size, 0) <= ?
+		  AND ext IN (%s)
+		ORDER BY COALESCE(mtime, 0) DESC
+		LIMIT ?`, placeholders)
+
+	rows, err := r.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FileIndex
+	for rows.Next() {
+		f, err := r.scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *f)
+	}
+	return out, rows.Err()
+}
+
+func (r *FileIndexRepo) ListEvidencePDFs(rootID, nodePath string, limit int, maxBytes int64) ([]FileIndex, error) {
+	pattern := EscapeLikeArg(nodePath) + `/%`
+	rows, err := r.db.Query(`SELECT `+fileIndexCols+` FROM file_index
+		WHERE root_id = ?
+		  AND (path = ? OR path LIKE ? ESCAPE '\')
+		  AND is_dir = 0
+		  AND is_opaque = 0
+		  AND status = 'present'
+		  AND COALESCE(size, 0) <= ?
+		  AND ext = 'pdf'
+		ORDER BY COALESCE(mtime, 0) DESC
+		LIMIT ?`, rootID, nodePath, pattern, maxBytes, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FileIndex
+	for rows.Next() {
+		f, err := r.scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *f)
+	}
+	return out, rows.Err()
+}
+
+// ListEvidenceChildren returns direct children of nodePath ordered by path.
+func (r *FileIndexRepo) ListEvidenceChildren(rootID, nodePath string, limit int) ([]FileIndex, error) {
+	rows, err := r.db.Query(`SELECT `+fileIndexCols+` FROM file_index
+		WHERE root_id = ?
+		  AND parent = ?
+		  AND status = 'present'
+		ORDER BY path
+		LIMIT ?`, rootID, nodePath, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FileIndex
+	for rows.Next() {
+		f, err := r.scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *f)
+	}
+	return out, rows.Err()
+}
+
+// ListEvidenceSkippedSample returns up to `limit` binary files (images,
+// videos, archives) under nodePath, so the LLM can see "what's here that I
+// didn't read".
+func (r *FileIndexRepo) ListEvidenceSkippedSample(rootID, nodePath string, limit int) ([]FileIndex, error) {
+	pattern := EscapeLikeArg(nodePath) + `/%`
+	rows, err := r.db.Query(`SELECT `+fileIndexCols+` FROM file_index
+		WHERE root_id = ?
+		  AND (path = ? OR path LIKE ? ESCAPE '\')
+		  AND is_dir = 0
+		  AND is_opaque = 0
+		  AND status = 'present'
+		  AND ext IN ('jpeg','jpg','png','heic','mov','mp4','zip','7z','tar','gz','rar','dmg','iso')
+		ORDER BY COALESCE(mtime, 0) DESC
+		LIMIT ?`, rootID, nodePath, pattern, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FileIndex
+	for rows.Next() {
+		f, err := r.scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *f)
+	}
+	return out, rows.Err()
 }
 
 func (r *FileIndexRepo) RewritePathPrefix(tx *sql.Tx, rootID, oldPrefix, newPrefix string) error {

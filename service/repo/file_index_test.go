@@ -2,7 +2,9 @@ package repo
 
 import (
 	"testing"
+	"time"
 
+	"github.com/NimoTech/NimoOS-Wiki/pkg/db"
 	"github.com/stretchr/testify/require"
 )
 
@@ -27,4 +29,112 @@ func TestFileIndex_RewriteAndCaseSensitivity(t *testing.T) {
 	got2, _ := r.Get("r", "/DATA/projecta/y.txt")
 	require.NotNil(t, got2, "lowercase must not be touched")
 	require.Equal(t, "/DATA/projecta", got2.Parent)
+}
+
+func TestFileIndex_ListEvidence_FiltersByExtAndSize(t *testing.T) {
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	defer d.Close()
+	files := NewFileIndex(d)
+
+	rootID := "r"
+	now := time.Now().UnixMilli()
+	for _, f := range []struct {
+		path   string
+		ext    string
+		size   int64
+		isDir  bool
+		opaque bool
+	}{
+		{"/root/a.md", "md", 1024, false, false},
+		{"/root/b.txt", "txt", 32768, false, false},
+		{"/root/huge.md", "md", 100000, false, false},
+		{"/root/doc.pdf", "pdf", 500000, false, false},
+		{"/root/giant.pdf", "pdf", 10000000, false, false},
+		{"/root/img.jpeg", "jpeg", 3000000, false, false},
+		{"/root/vid.mov", "mov", 50000000, false, false},
+		{"/root/immich", "", 0, true, true},
+	} {
+		require.NoError(t, files.Upsert(FileIndex{
+			ID: NewID(), RootID: rootID, Path: f.path,
+			Parent: "/root", IsDir: f.isDir, IsOpaque: f.opaque,
+			Status: "present", Ext: f.ext, Size: f.size, Mtime: now,
+		}))
+	}
+
+	got, err := files.ListEvidenceTextFiles(rootID, "/root", 10, 51200)
+	require.NoError(t, err)
+	paths := []string{}
+	for _, r := range got {
+		paths = append(paths, r.Path)
+	}
+	require.ElementsMatch(t, []string{"/root/a.md", "/root/b.txt"}, paths)
+
+	pdfs, err := files.ListEvidencePDFs(rootID, "/root", 10, 5242880)
+	require.NoError(t, err)
+	pdfPaths := []string{}
+	for _, r := range pdfs {
+		pdfPaths = append(pdfPaths, r.Path)
+	}
+	require.ElementsMatch(t, []string{"/root/doc.pdf"}, pdfPaths)
+}
+
+func TestFileIndex_ListEvidence_ScopesToSubtree(t *testing.T) {
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	defer d.Close()
+	files := NewFileIndex(d)
+	rootID := "r"
+	now := time.Now().UnixMilli()
+	for _, p := range []string{"/inside/a.md", "/inside/sub/b.md", "/sibling/c.md"} {
+		// helper for parent
+		parent := "/"
+		for i := len(p) - 1; i >= 0; i-- {
+			if p[i] == '/' {
+				if i == 0 {
+					parent = "/"
+				} else {
+					parent = p[:i]
+				}
+				break
+			}
+		}
+		require.NoError(t, files.Upsert(FileIndex{
+			ID: NewID(), RootID: rootID, Path: p, Parent: parent,
+			IsDir: false, IsOpaque: false, Status: "present",
+			Ext: "md", Size: 100, Mtime: now,
+		}))
+	}
+	got, err := files.ListEvidenceTextFiles(rootID, "/inside", 10, 51200)
+	require.NoError(t, err)
+	paths := []string{}
+	for _, r := range got {
+		paths = append(paths, r.Path)
+	}
+	require.ElementsMatch(t, []string{"/inside/a.md", "/inside/sub/b.md"}, paths,
+		"should include direct children AND deeper descendants, exclude siblings")
+}
+
+func TestFileIndex_ListEvidence_ChildMap(t *testing.T) {
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	defer d.Close()
+	files := NewFileIndex(d)
+	rootID := "r"
+	for _, p := range []struct {
+		path  string
+		isDir bool
+	}{
+		{"/x/file.md", false},
+		{"/x/sub", true},
+		{"/x/other.txt", false},
+	} {
+		require.NoError(t, files.Upsert(FileIndex{
+			ID: NewID(), RootID: rootID, Path: p.path, Parent: "/x",
+			IsDir: p.isDir, Status: "present", Mtime: 1,
+		}))
+	}
+	got, err := files.ListEvidenceChildren(rootID, "/x", 100)
+	require.NoError(t, err)
+	require.Len(t, got, 3)
 }

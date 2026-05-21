@@ -2,6 +2,7 @@ package v1
 
 import (
 	"net/http"
+	"path/filepath"
 	"strconv"
 
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
@@ -53,4 +54,129 @@ func getInternalFileEvents(d Deps) echo.HandlerFunc {
 		}
 		return c.JSON(http.StatusOK, map[string]any{"events": evs})
 	}
+}
+
+type evidenceChildEntry struct {
+	Name  string `json:"name"`
+	Size  int64  `json:"size"`
+	IsDir bool   `json:"is_dir"`
+	Ext   string `json:"ext"`
+}
+
+type evidenceFileEntry struct {
+	Path    string `json:"path"`
+	Size    int64  `json:"size"`
+	MtimeMs int64  `json:"mtime_ms"`
+	Ext     string `json:"ext"`
+}
+
+type evidenceSkippedEntry struct {
+	Path   string `json:"path"`
+	Size   int64  `json:"size"`
+	Ext    string `json:"ext"`
+	Reason string `json:"reason"`
+}
+
+func getInternalNodeEvidence(d Deps) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		path := c.QueryParam("path")
+		if path == "" {
+			return echo.NewHTTPError(http.StatusBadRequest, "missing path")
+		}
+		node, err := d.Nodes.Get(path)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+		if node == nil {
+			return echo.NewHTTPError(http.StatusNotFound, "wiki_node not found")
+		}
+		rootID := ""
+		if node.RootID != nil {
+			rootID = *node.RootID
+		}
+		textLimit := clampInt(c.QueryParam("text_limit"), 10, 1, 20)
+		pdfLimit := clampInt(c.QueryParam("pdf_limit"), 5, 1, 10)
+
+		text, err := d.Files.ListEvidenceTextFiles(rootID, path, textLimit, 51200)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+		pdfs, err := d.Files.ListEvidencePDFs(rootID, path, pdfLimit, 5242880)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+		children, err := d.Files.ListEvidenceChildren(rootID, path, 100)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+		skipped, err := d.Files.ListEvidenceSkippedSample(rootID, path, 20)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+
+		body := map[string]any{
+			"node_path":      path,
+			"child_map":      buildChildMap(children),
+			"text_files":     buildFileEntries(text),
+			"pdf_files":      buildFileEntries(pdfs),
+			"skipped_sample": buildSkippedEntries(skipped),
+		}
+		return c.JSON(http.StatusOK, body)
+	}
+}
+
+func buildChildMap(rows []repo.FileIndex) []evidenceChildEntry {
+	out := make([]evidenceChildEntry, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, evidenceChildEntry{
+			Name:  filepath.Base(r.Path),
+			Size:  r.Size,
+			IsDir: r.IsDir,
+			Ext:   r.Ext,
+		})
+	}
+	return out
+}
+
+func buildFileEntries(rows []repo.FileIndex) []evidenceFileEntry {
+	out := make([]evidenceFileEntry, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, evidenceFileEntry{
+			Path: r.Path, Size: r.Size, MtimeMs: r.Mtime, Ext: r.Ext,
+		})
+	}
+	return out
+}
+
+func buildSkippedEntries(rows []repo.FileIndex) []evidenceSkippedEntry {
+	out := make([]evidenceSkippedEntry, 0, len(rows))
+	for _, r := range rows {
+		reason := "binary"
+		switch r.Ext {
+		case "jpeg", "jpg", "png", "heic":
+			reason = "image"
+		case "mov", "mp4":
+			reason = "video"
+		case "zip", "7z", "tar", "gz", "rar", "dmg", "iso":
+			reason = "archive"
+		}
+		out = append(out, evidenceSkippedEntry{
+			Path: r.Path, Size: r.Size, Ext: r.Ext, Reason: reason,
+		})
+	}
+	return out
+}
+
+func clampInt(s string, def, min, max int) int {
+	v, err := strconv.Atoi(s)
+	if err != nil || v <= 0 {
+		return def
+	}
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
 }

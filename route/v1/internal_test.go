@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/NimoTech/NimoOS-Wiki/pkg/db"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
@@ -80,4 +81,71 @@ func TestNeedsSummary_EmptyQueue(t *testing.T) {
 	InitRouter(mgrs).ServeHTTP(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.JSONEq(t, `{"nodes": []}`, rec.Body.String())
+}
+
+func TestNodeEvidence_FromFileIndex(t *testing.T) {
+	_, mgrs := setupInternalTest(t)
+	rootID := "r"
+	require.NoError(t, mgrs.WikiRoots.Insert(repo.WikiRoot{
+		ID: rootID, Path: "/root", Level: "project",
+		WatchMode: "auto", StorageMode: "inline", Enabled: true,
+	}))
+	require.NoError(t, mgrs.Nodes.Upsert(repo.WikiNode{
+		ID: "n", RootID: &rootID, Path: "/root", Level: "project", UpdatedAt: 1,
+	}))
+	now := time.Now().UnixMilli()
+	for _, f := range []struct {
+		path  string
+		ext   string
+		size  int64
+		isDir bool
+	}{
+		{"/root/a.md", "md", 1024, false},
+		{"/root/doc.pdf", "pdf", 500000, false},
+		{"/root/IMG.jpeg", "jpeg", 3000000, false},
+		{"/root/sub", "", 0, true},
+	} {
+		require.NoError(t, mgrs.Files.Upsert(repo.FileIndex{
+			ID: repo.NewID(), RootID: rootID, Path: f.path, Parent: "/root",
+			IsDir: f.isDir, Status: "present", Ext: f.ext, Size: f.size, Mtime: now,
+		}))
+	}
+
+	req := httptest.NewRequest("GET",
+		"/v1/wiki/_internal/node-evidence?path=/root&text_limit=10&pdf_limit=5", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	rec := httptest.NewRecorder()
+	InitRouter(mgrs).ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body struct {
+		NodePath      string           `json:"node_path"`
+		ChildMap      []map[string]any `json:"child_map"`
+		TextFiles     []map[string]any `json:"text_files"`
+		PDFFiles      []map[string]any `json:"pdf_files"`
+		SkippedSample []map[string]any `json:"skipped_sample"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Equal(t, "/root", body.NodePath)
+	require.Len(t, body.TextFiles, 1)
+	require.Equal(t, "/root/a.md", body.TextFiles[0]["path"])
+	require.Len(t, body.PDFFiles, 1)
+	require.Len(t, body.SkippedSample, 1)
+	require.Len(t, body.ChildMap, 4)
+	names := []string{}
+	for _, c := range body.ChildMap {
+		names = append(names, c["name"].(string))
+	}
+	require.Contains(t, names, "a.md")
+	require.Contains(t, names, "sub")
+}
+
+func TestNodeEvidence_BadPath(t *testing.T) {
+	_, mgrs := setupInternalTest(t)
+	req := httptest.NewRequest("GET",
+		"/v1/wiki/_internal/node-evidence?path=/does/not/exist", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	rec := httptest.NewRecorder()
+	InitRouter(mgrs).ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNotFound, rec.Code)
 }
