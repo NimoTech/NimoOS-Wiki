@@ -131,6 +131,7 @@ func TestNodeEvidence_FromFileIndex(t *testing.T) {
 	require.Equal(t, "/root/a.md", body.TextFiles[0]["path"])
 	require.Len(t, body.PDFFiles, 1)
 	require.Len(t, body.SkippedSample, 1)
+	require.Equal(t, "image", body.SkippedSample[0]["reason"], "jpeg should be classified as image")
 	require.Len(t, body.ChildMap, 4)
 	names := []string{}
 	for _, c := range body.ChildMap {

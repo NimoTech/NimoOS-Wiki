@@ -167,16 +167,16 @@ func buildSkippedEntries(rows []repo.FileIndex) []evidenceSkippedEntry {
 	return out
 }
 
-func clampInt(s string, def, min, max int) int {
+func clampInt(s string, def, lo, hi int) int {
 	v, err := strconv.Atoi(s)
 	if err != nil || v <= 0 {
 		return def
 	}
-	if v < min {
-		return min
+	if v < lo {
+		return lo
 	}
-	if v > max {
-		return max
+	if v > hi {
+		return hi
 	}
 	return v
 }
