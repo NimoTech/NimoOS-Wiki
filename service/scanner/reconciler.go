@@ -28,6 +28,12 @@ func NewReconciler(files *repo.FileIndexRepo, events *repo.FileEventsRepo, ig *i
 // Reconcile diffs rootPath against file_index for rootID.
 // Inserts file_events for: create/modify/delete; updates file_index accordingly.
 // Containers are recorded as a single is_opaque=true row in file_index and not recursed into.
+//
+// SILENT PURGE: when a previously-indexed row falls under a directory that is
+// NOW recognized as opaque (e.g., immich just got added to the container
+// baseline), the row is removed from file_index WITHOUT emitting a delete
+// event. This prevents a one-shot baseline change from flooding Recent
+// Changes with delete events the user never asked for.
 func (r *Reconciler) Reconcile(rootID, rootPath string) error {
 	existing, err := r.files.ListAllByRoot(rootID)
 	if err != nil {
@@ -39,6 +45,7 @@ func (r *Reconciler) Reconcile(rootID, rootPath string) error {
 	}
 
 	now := time.Now().UnixMilli()
+	opaqueDirs := make([]string, 0, 8) // populated during walk
 
 	walkFn := func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -55,6 +62,9 @@ func (r *Reconciler) Reconcile(rootID, rootPath string) error {
 		}
 
 		isOpaque := d.IsDir() && r.ig.IsContainerDir(base)
+		if isOpaque {
+			opaqueDirs = append(opaqueDirs, p)
+		}
 
 		info, statErr := d.Info()
 		var mtime, size int64
@@ -109,8 +119,26 @@ func (r *Reconciler) Reconcile(rootID, rootPath string) error {
 		return err
 	}
 
-	// Remaining entries in seen = deleted on disk
+	// Remaining entries in seen = no longer present in walk.
+	// Two cases:
+	//   1. Path is under a now-opaque ancestor → silent purge (no event).
+	//   2. Otherwise → genuine delete, emit a delete event.
+	//
+	// NOTE on edge case: if the user actually deletes a previously-opaque dir
+	// from disk (e.g., `rm -rf /root/immich`), WalkDir never visits it, so it
+	// is NOT in opaqueDirs. The dir itself + everything under it falls into
+	// case 2 — a delete event fires for /root/immich AND for every descendant
+	// that hadn't already been rolled up. For a 1000-file install that's
+	// 1000 delete events, which is the same flooding shape silent purge was
+	// designed to avoid — accepted as a trade-off because real deletions
+	// SHOULD be visible to downstream consumers (UI cache invalidation, etc),
+	// even if noisy. The silent purge intentionally covers only the "I became
+	// opaque" migration artifact, not user-initiated deletions.
 	for path, old := range seen {
+		if hasOpaqueAncestor(path, opaqueDirs) {
+			_ = r.files.DeleteByPath(rootID, path)
+			continue
+		}
 		_ = r.events.Insert(repo.FileEvent{
 			ID: repo.NewID(), RootID: rootID, Path: path, Op: "delete",
 			IsDir: old.IsDir, DetectedAt: now,
@@ -118,6 +146,18 @@ func (r *Reconciler) Reconcile(rootID, rootPath string) error {
 		_ = r.files.DeleteByPath(rootID, path)
 	}
 	return nil
+}
+
+// hasOpaqueAncestor reports whether path lives strictly under any dir in
+// opaqueDirs (i.e., path starts with `<dir>/`). The opaque dir itself doesn't
+// count — it has its own opaque row that we want to keep.
+func hasOpaqueAncestor(path string, opaqueDirs []string) bool {
+	for _, dir := range opaqueDirs {
+		if strings.HasPrefix(path, dir+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // Run periodically reconciles a single Root until ctx is cancelled.
