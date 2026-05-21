@@ -85,7 +85,7 @@ func (w *Writer) FlushOne(nodePath string) error {
 		return nil
 	}
 
-	doc, err := w.buildDoc(node)
+	doc, childCount, err := w.buildDoc(node)
 	if err != nil {
 		return err
 	}
@@ -118,6 +118,12 @@ func (w *Writer) FlushOne(nodePath string) error {
 		return err
 	}
 
+	// Best-effort: update cached child_count. Failure is non-fatal — the
+	// .wiki.md file is already written and RecordFlush succeeded.
+	if err := w.nodes.SetChildCount(nodePath, childCount); err != nil {
+		w.log.Warn("SetChildCount failed", zap.String("path", nodePath), zap.Error(err))
+	}
+
 	if err := os.Rename(tmp, target); err != nil {
 		// DB already updated but file is in inconsistent state.
 		// Re-dirty so next flush retries.
@@ -137,7 +143,9 @@ func (w *Writer) FlushOne(nodePath string) error {
 }
 
 // buildDoc populates wikimd.Doc from node + child_map + recent events.
-func (w *Writer) buildDoc(node *repo.WikiNode) (wikimd.Doc, error) {
+// Also returns the direct-child count (len of ListByParent result) so the
+// caller can persist it to wiki_nodes.child_count.
+func (w *Writer) buildDoc(node *repo.WikiNode) (wikimd.Doc, int, error) {
 	rootID := ""
 	if node.RootID != nil {
 		rootID = *node.RootID
@@ -146,7 +154,7 @@ func (w *Writer) buildDoc(node *repo.WikiNode) (wikimd.Doc, error) {
 	// Child map from file_index (direct children only)
 	children, err := w.files.ListByParent(rootID, node.Path)
 	if err != nil {
-		return wikimd.Doc{}, err
+		return wikimd.Doc{}, 0, err
 	}
 	cmEntries := make([]childmap.Entry, 0, len(children))
 	for _, c := range children {
@@ -201,7 +209,7 @@ func (w *Writer) buildDoc(node *repo.WikiNode) (wikimd.Doc, error) {
 		RecentChanges: rcs,
 		UserNotes:     node.UserNotes,
 		Summary:       summaryText,
-	}, nil
+	}, len(children), nil
 }
 
 func groupDisplayName(g childmap.Group) string {

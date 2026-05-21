@@ -1,6 +1,7 @@
 package writer
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
@@ -164,4 +165,42 @@ func TestWriter_RendersSummaryFromRepo(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(wikiMD), "测试目录概要。",
 		"Summary section should contain the wiki_summaries.summary content")
+}
+
+func openTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	return d
+}
+
+func TestWriter_FlushUpdatesChildCount(t *testing.T) {
+	d := openTestDB(t)
+	nodes := repo.NewWikiNodes(d)
+	files := repo.NewFileIndex(d)
+	events := repo.NewFileEvents(d)
+	summaries := repo.NewWikiSummaries(d)
+
+	rootID := "r"
+	tmp := t.TempDir()
+	require.NoError(t, nodes.Upsert(repo.WikiNode{
+		ID: "n", RootID: &rootID, Path: tmp, Level: "project",
+		Dirty: true, ChildCount: 0, UpdatedAt: 1,
+	}))
+	// Insert 3 direct children into file_index
+	for _, name := range []string{"a.txt", "b.md", "sub"} {
+		require.NoError(t, files.Upsert(repo.FileIndex{
+			ID: repo.NewID(), RootID: rootID,
+			Path: filepath.Join(tmp, name), Parent: tmp,
+			IsDir: name == "sub", Status: "present", Mtime: 1,
+		}))
+	}
+
+	w := newTestWriter(t, nodes, files, events, summaries)
+	require.NoError(t, w.FlushOne(tmp))
+
+	got, _ := nodes.Get(tmp)
+	require.Equal(t, 3, got.ChildCount,
+		"child_count should be set to the number of direct children in file_index")
 }

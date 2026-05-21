@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NimoTech/NimoOS-Wiki/pkg/db"
 	"github.com/stretchr/testify/require"
 )
 
@@ -185,6 +186,44 @@ func TestWikiNodes_SetDirtyAndTouch_HandlesNullLastModified(t *testing.T) {
 	require.NoError(t, r.SetDirtyAndTouch("/x", 2000))
 	got, _ := r.Get("/x")
 	require.Equal(t, int64(2000), got.LastModified)
+}
+
+func TestWikiNodes_SetChildCount(t *testing.T) {
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	defer d.Close()
+	r := NewWikiNodes(d)
+
+	rootID := "r"
+	require.NoError(t, r.Upsert(WikiNode{
+		ID: "n1", RootID: &rootID, Path: "/x", Level: "project",
+		ChildCount: 0, UpdatedAt: 1,
+	}))
+	require.NoError(t, r.SetChildCount("/x", 7))
+
+	got, _ := r.Get("/x")
+	require.Equal(t, 7, got.ChildCount)
+}
+
+func TestWikiNodes_SetChildCount_DoesNotChangeOtherFields(t *testing.T) {
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	defer d.Close()
+	r := NewWikiNodes(d)
+
+	rootID := "r"
+	require.NoError(t, r.Upsert(WikiNode{
+		ID: "n1", RootID: &rootID, Path: "/x", Level: "project",
+		AILabel: "标签", LastModified: 5000, UpdatedAt: 100,
+	}))
+	require.NoError(t, r.SetDirty("/x", true))
+	require.NoError(t, r.SetChildCount("/x", 3))
+
+	got, _ := r.Get("/x")
+	require.Equal(t, 3, got.ChildCount)
+	require.Equal(t, "标签", got.AILabel, "ai_label must not change")
+	require.Equal(t, int64(5000), got.LastModified, "last_modified must not change")
+	require.True(t, got.Dirty, "dirty must not be cleared by SetChildCount")
 }
 
 func TestWikiNode_List_ReturnsAILabelAndTimestamps(t *testing.T) {

@@ -178,6 +178,17 @@ func (r *WikiNodesRepo) SetDirtyAndTouch(path string, mtime int64) error {
 	return err
 }
 
+// SetChildCount updates the direct-child count cached on the wiki_node.
+// Called by WikiWriter after buildDoc has counted direct children via
+// file_index. Pure cache update — does NOT touch dirty / last_modified /
+// ai_label or any other column. updated_at not bumped either (writer is
+// already calling RecordFlush which handles audit-relevant timestamps).
+func (r *WikiNodesRepo) SetChildCount(path string, count int) error {
+	_, err := r.db.Exec(`UPDATE wiki_nodes SET child_count = ? WHERE path = ?`,
+		count, path)
+	return err
+}
+
 // SetAILabel updates ai_label, sets dirty=1 (so WikiWriter re-renders
 // .wiki.md to include the new Summary section), and bumps updated_at.
 // Does NOT touch last_modified — that's only advanced by EventProcessor
