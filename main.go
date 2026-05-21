@@ -102,7 +102,7 @@ func main() {
 	if config.Cfg.EventDebounceMs > 0 {
 		proc.EventDebounceMs = config.Cfg.EventDebounceMs
 	}
-	wri := writer.NewWriter(rNodes, rFiles, rEvents, bus, locks,
+	wri := writer.NewWriter(rNodes, rFiles, rEvents, bus, locks, rSummaries,
 		time.Duration(config.Cfg.WikiWriteDebounceSec)*time.Second, zapLog)
 
 	// Boot reconcile: replay drift BEFORE accepting traffic / starting watchers.

@@ -26,17 +26,18 @@ import (
 // harness wires up the full Wiki service in-process and runs the same
 // goroutines main.go does. Cancel ctx to stop.
 type harness struct {
-	files  *repo.FileIndexRepo
-	events *repo.FileEventsRepo
-	nodes  *repo.WikiNodesRepo
-	roots  *repo.WikiRootsRepo
-	parse  *repo.ParseStatusRepo
-	mgr    *roots.Manager
-	watch  *scanner.Watcher
-	rec    *scanner.Reconciler
-	proc   *processor.EventProcessor
-	wri    *writer.Writer
-	wg     *sync.WaitGroup
+	files     *repo.FileIndexRepo
+	events    *repo.FileEventsRepo
+	nodes     *repo.WikiNodesRepo
+	roots     *repo.WikiRootsRepo
+	parse     *repo.ParseStatusRepo
+	summaries *repo.WikiSummariesRepo
+	mgr       *roots.Manager
+	watch     *scanner.Watcher
+	rec       *scanner.Reconciler
+	proc      *processor.EventProcessor
+	wri       *writer.Writer
+	wg        *sync.WaitGroup
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -53,11 +54,12 @@ func newHarness(t *testing.T) (*harness, context.CancelFunc) {
 	require.NoError(t, err)
 
 	h := &harness{
-		files:  repo.NewFileIndex(d),
-		events: repo.NewFileEvents(d),
-		nodes:  repo.NewWikiNodes(d),
-		roots:  repo.NewWikiRoots(d),
-		parse:  repo.NewParseStatus(d),
+		files:     repo.NewFileIndex(d),
+		events:    repo.NewFileEvents(d),
+		nodes:     repo.NewWikiNodes(d),
+		roots:     repo.NewWikiRoots(d),
+		parse:     repo.NewParseStatus(d),
+		summaries: repo.NewWikiSummaries(d),
 	}
 	bus := eventbus.Noop{}
 	ig := ignore.New([]string{"node_modules", ".git"})
@@ -68,7 +70,7 @@ func newHarness(t *testing.T) (*harness, context.CancelFunc) {
 	h.proc = processor.New(d, h.files, h.events, h.nodes, h.parse, bus, ig, locks, nil)
 	h.proc.SyncIn = h.watch.SyncOut
 	// 0 debounce window so tests don't wait 5s
-	h.wri = writer.NewWriter(h.nodes, h.files, h.events, bus, locks, 0, nil)
+	h.wri = writer.NewWriter(h.nodes, h.files, h.events, bus, locks, h.summaries, 0, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	h.ctx = ctx

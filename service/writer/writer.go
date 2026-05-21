@@ -35,6 +35,7 @@ type Writer struct {
 	events             *repo.FileEventsRepo
 	bus                eventbus.Bus
 	locks              *nodelock.Locks
+	summaries          *repo.WikiSummariesRepo
 	debounceWindow     time.Duration
 	aggregateThreshold int
 	log                *zap.Logger
@@ -47,6 +48,7 @@ type Writer struct {
 // a fresh local set — safe for tests, broken in production.
 func NewWriter(nodes *repo.WikiNodesRepo, files *repo.FileIndexRepo,
 	events *repo.FileEventsRepo, bus eventbus.Bus, locks *nodelock.Locks,
+	summaries *repo.WikiSummariesRepo,
 	debounceWindow time.Duration, log *zap.Logger) *Writer {
 	if log == nil {
 		log = zap.NewNop()
@@ -59,6 +61,7 @@ func NewWriter(nodes *repo.WikiNodesRepo, files *repo.FileIndexRepo,
 	}
 	return &Writer{
 		nodes: nodes, files: files, events: events, bus: bus, locks: locks,
+		summaries: summaries,
 		debounceWindow: debounceWindow, aggregateThreshold: 50, log: log,
 	}
 }
@@ -180,6 +183,13 @@ func (w *Writer) buildDoc(node *repo.WikiNode) (wikimd.Doc, error) {
 		})
 	}
 
+	var summaryText string
+	if w.summaries != nil {
+		if s, err := w.summaries.Get(node.Path); err == nil && s != nil {
+			summaryText = s.Summary
+		}
+	}
+
 	return wikimd.Doc{
 		Version:       1,
 		RootID:        rootID,
@@ -190,6 +200,7 @@ func (w *Writer) buildDoc(node *repo.WikiNode) (wikimd.Doc, error) {
 		ChildMap:      cms,
 		RecentChanges: rcs,
 		UserNotes:     node.UserNotes,
+		Summary:       summaryText,
 	}, nil
 }
 

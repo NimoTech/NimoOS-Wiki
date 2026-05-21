@@ -11,6 +11,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// newTestWriter creates a Writer for tests, accepting nil for optional args.
+// Use this whenever constructing a Writer in tests so call sites don't need
+// to be updated when NewWriter's signature grows.
+func newTestWriter(t *testing.T, nodes *repo.WikiNodesRepo, files *repo.FileIndexRepo,
+	events *repo.FileEventsRepo, summaries *repo.WikiSummariesRepo) *Writer {
+	t.Helper()
+	return NewWriter(nodes, files, events, nil /*bus*/, nil /*locks*/, summaries,
+		0 /*debounce*/, nil /*logger*/)
+}
+
 func setupWriter(t *testing.T) (*Writer, *repo.WikiNodesRepo, *repo.FileIndexRepo, *repo.FileEventsRepo) {
 	t.Helper()
 	d, err := db.Open(":memory:")
@@ -19,7 +29,7 @@ func setupWriter(t *testing.T) (*Writer, *repo.WikiNodesRepo, *repo.FileIndexRep
 	nodes := repo.NewWikiNodes(d)
 	files := repo.NewFileIndex(d)
 	events := repo.NewFileEvents(d)
-	w := NewWriter(nodes, files, events, nil, nil, 0, nil)
+	w := newTestWriter(t, nodes, files, events, nil)
 	return w, nodes, files, events
 }
 
@@ -50,7 +60,7 @@ func TestWriter_DebounceSkipsRecentFlush(t *testing.T) {
 	require.NoError(t, err)
 	defer d.Close()
 	nodes := repo.NewWikiNodes(d)
-	w := NewWriter(nodes, repo.NewFileIndex(d), repo.NewFileEvents(d), nil, nil, 5*time.Second, nil)
+	w := NewWriter(nodes, repo.NewFileIndex(d), repo.NewFileEvents(d), nil, nil, nil, 5*time.Second, nil)
 
 	tmp := t.TempDir()
 	now := time.Now().UnixMilli()
@@ -124,4 +134,34 @@ func TestWriter_MtimeRecordedMatchesFile(t *testing.T) {
 	require.NoError(t, err)
 	n, _ := nodes.Get(tmp)
 	require.Equal(t, info.ModTime().UnixMilli(), n.LastFlushedMtime)
+}
+
+func TestWriter_RendersSummaryFromRepo(t *testing.T) {
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+
+	nodes := repo.NewWikiNodes(d)
+	files := repo.NewFileIndex(d)
+	events := repo.NewFileEvents(d)
+	summaries := repo.NewWikiSummaries(d)
+
+	rootID := "r"
+	tmp := t.TempDir()
+	require.NoError(t, nodes.Upsert(repo.WikiNode{
+		ID: "n", RootID: &rootID, Path: tmp, Level: "project",
+		Dirty: true, UpdatedAt: 1,
+	}))
+	require.NoError(t, summaries.Upsert(repo.WikiSummary{
+		Path: tmp, Summary: "测试目录概要。",
+		GeneratedAt: 1, BasedOnLastModified: 1, GeneratorVersion: "test",
+	}))
+
+	w := newTestWriter(t, nodes, files, events, summaries)
+	require.NoError(t, w.FlushOne(tmp))
+
+	wikiMD, err := os.ReadFile(filepath.Join(tmp, ".wiki.md"))
+	require.NoError(t, err)
+	require.Contains(t, string(wikiMD), "测试目录概要。",
+		"Summary section should contain the wiki_summaries.summary content")
 }
