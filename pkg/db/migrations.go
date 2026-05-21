@@ -73,6 +73,15 @@ var migrations = []string{
 		error TEXT
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_parse_status_pending ON parse_status(status) WHERE status IN ('pending', 'failed')`,
+	`CREATE TABLE IF NOT EXISTS wiki_summaries (
+		path                    TEXT PRIMARY KEY,
+		summary                 TEXT NOT NULL DEFAULT '',
+		generated_at            INTEGER NOT NULL,
+		based_on_last_modified  INTEGER NOT NULL,
+		generator_version       TEXT NOT NULL DEFAULT '',
+		FOREIGN KEY (path) REFERENCES wiki_nodes(path) ON DELETE CASCADE
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_wiki_summaries_generated_at ON wiki_summaries(generated_at)`,
 }
 
 // addColumnIfMissing runs `ALTER TABLE t ADD COLUMN ...` only if `col` is not
