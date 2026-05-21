@@ -141,16 +141,16 @@ func (p *EventProcessor) process(ctx context.Context, e repo.FileEvent) error {
 		if !e.IsDir {
 			_ = p.parse.InsertPending(e.Path)
 		}
-		p.markNearestWikiNodeDirty(e.Path)
+		p.markNearestWikiNodeDirty(e.Path, e.DetectedAt)
 
 	case "modify":
-		p.markNearestWikiNodeDirty(e.Path)
+		p.markNearestWikiNodeDirty(e.Path, e.DetectedAt)
 
 	case "delete":
 		if err := p.files.DeleteByPath(e.RootID, e.Path); err != nil {
 			return err
 		}
-		p.markNearestWikiNodeDirty(e.Path)
+		p.markNearestWikiNodeDirty(e.Path, e.DetectedAt)
 
 	case "rename":
 		if e.RenameTo == "" {
@@ -158,7 +158,7 @@ func (p *EventProcessor) process(ctx context.Context, e repo.FileEvent) error {
 			if err := p.files.DeleteByPath(e.RootID, e.Path); err != nil {
 				return err
 			}
-			p.markNearestWikiNodeDirty(e.Path)
+			p.markNearestWikiNodeDirty(e.Path, e.DetectedAt)
 			return nil
 		}
 		if !e.IsDir {
@@ -173,8 +173,8 @@ func (p *EventProcessor) process(ctx context.Context, e repo.FileEvent) error {
 			}); err != nil {
 				return err
 			}
-			p.markNearestWikiNodeDirty(e.Path)
-			p.markNearestWikiNodeDirty(e.RenameTo)
+			p.markNearestWikiNodeDirty(e.Path, e.DetectedAt)
+			p.markNearestWikiNodeDirty(e.RenameTo, e.DetectedAt)
 			return nil
 		}
 		// Directory rename → cascade UPDATE inside a single transaction
@@ -197,21 +197,23 @@ func (p *EventProcessor) process(ctx context.Context, e repo.FileEvent) error {
 		if err := tx.Commit(); err != nil {
 			return err
 		}
-		p.markNearestWikiNodeDirty(e.Path)
-		p.markNearestWikiNodeDirty(e.RenameTo)
+		p.markNearestWikiNodeDirty(e.Path, e.DetectedAt)
+		p.markNearestWikiNodeDirty(e.RenameTo, e.DetectedAt)
 		p.bus.Publish(common.EventNodeUpdated, map[string]any{"path": e.RenameTo})
 	}
 	return nil
 }
 
 // markNearestWikiNodeDirty walks up the directory tree from the event path,
-// marking the nearest existing wiki_node dirty (which triggers regeneration).
-func (p *EventProcessor) markNearestWikiNodeDirty(path string) {
+// marking the nearest existing wiki_node dirty AND advancing its
+// last_modified to mtime (using MAX, so reordered/stale events don't
+// regress the field). mtime is the event's DetectedAt.
+func (p *EventProcessor) markNearestWikiNodeDirty(path string, mtime int64) {
 	cur := pathutil.Parent(path)
 	for {
 		n, err := p.nodes.Get(cur)
 		if err == nil && n != nil {
-			_ = p.nodes.SetDirty(cur, true)
+			_ = p.nodes.SetDirtyAndTouch(cur, mtime)
 			return
 		}
 		if cur == "/" {

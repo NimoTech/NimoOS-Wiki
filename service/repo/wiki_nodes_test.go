@@ -144,6 +144,49 @@ func TestWikiNode_List_EmptyRootID_ReturnsAllNodes(t *testing.T) {
 	}
 }
 
+func TestWikiNodes_SetDirtyAndTouch_AdvancesLastModified(t *testing.T) {
+	d := openTestDB(t)
+	r := NewWikiNodes(d)
+
+	rootID := "r"
+	require.NoError(t, r.Upsert(WikiNode{
+		ID: "n1", RootID: &rootID, Path: "/x", Level: "project",
+		LastModified: 1000, UpdatedAt: 1,
+	}))
+	require.NoError(t, r.SetDirtyAndTouch("/x", 5000))
+	got, err := r.Get("/x")
+	require.NoError(t, err)
+	require.True(t, got.Dirty)
+	require.Equal(t, int64(5000), got.LastModified)
+}
+
+func TestWikiNodes_SetDirtyAndTouch_DoesNotRegress(t *testing.T) {
+	d := openTestDB(t)
+	r := NewWikiNodes(d)
+
+	rootID := "r"
+	require.NoError(t, r.Upsert(WikiNode{
+		ID: "n1", RootID: &rootID, Path: "/x", Level: "project",
+		LastModified: 5000, UpdatedAt: 1,
+	}))
+	require.NoError(t, r.SetDirtyAndTouch("/x", 3000))
+	got, _ := r.Get("/x")
+	require.Equal(t, int64(5000), got.LastModified, "MAX guard must prevent regression")
+}
+
+func TestWikiNodes_SetDirtyAndTouch_HandlesNullLastModified(t *testing.T) {
+	d := openTestDB(t)
+	r := NewWikiNodes(d)
+
+	rootID := "r"
+	require.NoError(t, r.Upsert(WikiNode{
+		ID: "n1", RootID: &rootID, Path: "/x", Level: "project", UpdatedAt: 1,
+	}))
+	require.NoError(t, r.SetDirtyAndTouch("/x", 2000))
+	got, _ := r.Get("/x")
+	require.Equal(t, int64(2000), got.LastModified)
+}
+
 func TestWikiNode_List_ReturnsAILabelAndTimestamps(t *testing.T) {
 	d := openTestDB(t)
 	r := NewWikiNodes(d)

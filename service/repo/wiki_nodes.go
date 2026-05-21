@@ -165,6 +165,19 @@ func (r *WikiNodesRepo) SetDirty(path string, dirty bool) error {
 	return err
 }
 
+// SetDirtyAndTouch sets dirty=1 and advances last_modified to mtime using MAX
+// so concurrent / reordered events from Reconciler vs Watcher can't regress
+// the field. Used by EventProcessor when processing a file event for any
+// descendant of this node.
+func (r *WikiNodesRepo) SetDirtyAndTouch(path string, mtime int64) error {
+	_, err := r.db.Exec(`UPDATE wiki_nodes
+		SET dirty = 1,
+		    last_modified = MAX(COALESCE(last_modified, 0), ?),
+		    updated_at = ?
+		WHERE path = ?`, mtime, time.Now().UnixMilli(), path)
+	return err
+}
+
 func (r *WikiNodesRepo) SetUserNotes(path, notes, etag string, at int64) error {
 	_, err := r.db.Exec(`UPDATE wiki_nodes
 		SET user_notes = ?, user_notes_etag = ?, user_notes_updated_at = ?,

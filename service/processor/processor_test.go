@@ -207,6 +207,45 @@ func (f *fakeBus) countOf(event string) int {
 	return n
 }
 
+func TestProcessor_AdvancesLastModifiedOnFileEvent(t *testing.T) {
+	p, _, events, nodes, _ := setup(t)
+	root := "r"
+	require.NoError(t, nodes.Upsert(repo.WikiNode{
+		ID: "n", RootID: &root, Path: "/root", Level: "project",
+		LastModified: 1000, UpdatedAt: 1,
+	}))
+	const eventMs = int64(5000)
+	require.NoError(t, events.Insert(repo.FileEvent{
+		ID: repo.NewID(), RootID: "r", Path: "/root/file.txt",
+		Op: "modify", DetectedAt: eventMs,
+	}))
+
+	require.NoError(t, p.ProcessBatch(context.Background()))
+
+	got, _ := nodes.Get("/root")
+	require.Equal(t, eventMs, got.LastModified,
+		"last_modified must advance to event.DetectedAt after ProcessBatch")
+	require.True(t, got.Dirty)
+}
+
+func TestProcessor_LastModifiedDoesNotRegress(t *testing.T) {
+	p, _, events, nodes, _ := setup(t)
+	root := "r"
+	require.NoError(t, nodes.Upsert(repo.WikiNode{
+		ID: "n", RootID: &root, Path: "/root", Level: "project",
+		LastModified: 5000, UpdatedAt: 1,
+	}))
+	require.NoError(t, events.Insert(repo.FileEvent{
+		ID: repo.NewID(), RootID: "r", Path: "/root/file.txt",
+		Op: "modify", DetectedAt: 3000,
+	}))
+
+	require.NoError(t, p.ProcessBatch(context.Background()))
+
+	got, _ := nodes.Get("/root")
+	require.Equal(t, int64(5000), got.LastModified, "MAX guard must hold")
+}
+
 func TestProcessor_RecentChangedAggregatedPerRoot(t *testing.T) {
 	d, err := db.Open(":memory:")
 	require.NoError(t, err)
