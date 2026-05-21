@@ -178,6 +178,18 @@ func (r *WikiNodesRepo) SetDirtyAndTouch(path string, mtime int64) error {
 	return err
 }
 
+// SetAILabel updates ai_label, sets dirty=1 (so WikiWriter re-renders
+// .wiki.md to include the new Summary section), and bumps updated_at.
+// Does NOT touch last_modified — that's only advanced by EventProcessor
+// on actual file events. Setting it here would self-trigger a re-summary
+// loop.
+func (r *WikiNodesRepo) SetAILabel(path, label string, at int64) error {
+	_, err := r.db.Exec(`UPDATE wiki_nodes
+		SET ai_label = ?, dirty = 1, updated_at = ?
+		WHERE path = ?`, label, at, path)
+	return err
+}
+
 func (r *WikiNodesRepo) SetUserNotes(path, notes, etag string, at int64) error {
 	_, err := r.db.Exec(`UPDATE wiki_nodes
 		SET user_notes = ?, user_notes_etag = ?, user_notes_updated_at = ?,

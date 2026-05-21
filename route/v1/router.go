@@ -50,7 +50,7 @@ func InitRouter(d Deps) *echo.Echo {
 	i := e.Group("/v1/wiki/_internal", route.LocalhostOnly)
 	i.GET("/needs-summary", getInternalNeedsSummary(d))
 	i.GET("/node-evidence", getInternalNodeEvidence(d))
-	i.POST("/summary", stubServiceUnavailable)
+	i.POST("/summary", postInternalSummary(d))
 	i.GET("/file-events", getInternalFileEvents(d))
 	i.POST("/index-status", stubServiceUnavailable)
 

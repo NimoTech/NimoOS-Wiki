@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
 	"github.com/labstack/echo/v4"
@@ -15,6 +16,61 @@ import (
 func stubServiceUnavailable(c echo.Context) error {
 	return echo.NewHTTPError(http.StatusServiceUnavailable,
 		"endpoint not yet implemented; reserved for future Parser/Summary worker")
+}
+
+type postSummaryBody struct {
+	Path                  string `json:"path"`
+	AILabel               string `json:"ai_label"`
+	Summary               string `json:"summary"`
+	BasedOnLastModifiedMs *int64 `json:"based_on_last_modified_ms"`
+	GeneratorVersion      string `json:"generator_version"`
+}
+
+func postInternalSummary(d Deps) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		var b postSummaryBody
+		if err := c.Bind(&b); err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "invalid JSON: "+err.Error())
+		}
+		if b.Path == "" {
+			return echo.NewHTTPError(http.StatusBadRequest, "missing path")
+		}
+		if b.AILabel == "" {
+			return echo.NewHTTPError(http.StatusBadRequest, "missing ai_label")
+		}
+		if len(b.AILabel) > 80 {
+			return echo.NewHTTPError(http.StatusBadRequest, "ai_label > 80 bytes")
+		}
+		if len(b.Summary) > 600 {
+			return echo.NewHTTPError(http.StatusBadRequest, "summary > 600 bytes")
+		}
+		if b.BasedOnLastModifiedMs == nil {
+			return echo.NewHTTPError(http.StatusBadRequest, "missing based_on_last_modified_ms")
+		}
+
+		node, err := d.Nodes.Get(b.Path)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+		if node == nil {
+			return echo.NewHTTPError(http.StatusNotFound, "wiki_node not found")
+		}
+
+		now := time.Now().UnixMilli()
+		if err := d.Nodes.SetAILabel(b.Path, b.AILabel, now); err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+		if err := d.Summaries.Upsert(repo.WikiSummary{
+			Path:                b.Path,
+			Summary:             b.Summary,
+			GeneratedAt:         now,
+			BasedOnLastModified: *b.BasedOnLastModifiedMs,
+			GeneratorVersion:    b.GeneratorVersion,
+		}); err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+		return c.JSON(http.StatusOK, map[string]any{"ok": true})
+	}
 }
 
 func getInternalNeedsSummary(d Deps) echo.HandlerFunc {

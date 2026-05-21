@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -149,4 +150,83 @@ func TestNodeEvidence_BadPath(t *testing.T) {
 	rec := httptest.NewRecorder()
 	InitRouter(mgrs).ServeHTTP(rec, req)
 	require.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestPostSummary_WritesBothTablesAndDirty(t *testing.T) {
+	_, mgrs := setupInternalTest(t)
+	rootID := "r"
+	require.NoError(t, mgrs.Nodes.Upsert(repo.WikiNode{
+		ID: "n", RootID: &rootID, Path: "/x", Level: "project",
+		AILabel: "", LastModified: 100, UpdatedAt: 1,
+	}))
+
+	body := `{
+		"path": "/x",
+		"ai_label": "AI 论文",
+		"summary": "这是一个目录摘要。",
+		"based_on_last_modified_ms": 100,
+		"generator_version": "wiki-summary-worker/0.1.0+gpt-4o-mini"
+	}`
+	req := httptest.NewRequest("POST", "/v1/wiki/_internal/summary",
+		strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "127.0.0.1:1234"
+	rec := httptest.NewRecorder()
+	InitRouter(mgrs).ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	n, _ := mgrs.Nodes.Get("/x")
+	require.Equal(t, "AI 论文", n.AILabel)
+	require.True(t, n.Dirty, "POST /summary must set dirty=1 to trigger WikiWriter")
+
+	s, _ := mgrs.Summaries.Get("/x")
+	require.NotNil(t, s)
+	require.Equal(t, "这是一个目录摘要。", s.Summary)
+	require.Equal(t, int64(100), s.BasedOnLastModified)
+	require.Equal(t, "wiki-summary-worker/0.1.0+gpt-4o-mini", s.GeneratorVersion)
+}
+
+func TestPostSummary_RejectsTooLongFields(t *testing.T) {
+	_, mgrs := setupInternalTest(t)
+	rootID := "r"
+	require.NoError(t, mgrs.Nodes.Upsert(repo.WikiNode{
+		ID: "n", RootID: &rootID, Path: "/x", Level: "project", UpdatedAt: 1,
+	}))
+	body := `{"path":"/x","ai_label":"` + strings.Repeat("X", 100) +
+		`","summary":"ok","based_on_last_modified_ms":1,"generator_version":"v"}`
+	req := httptest.NewRequest("POST", "/v1/wiki/_internal/summary",
+		strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "127.0.0.1:1234"
+	rec := httptest.NewRecorder()
+	InitRouter(mgrs).ServeHTTP(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestPostSummary_404ForUnknownPath(t *testing.T) {
+	_, mgrs := setupInternalTest(t)
+	body := `{"path":"/nope","ai_label":"X","summary":"x","based_on_last_modified_ms":1,"generator_version":"v"}`
+	req := httptest.NewRequest("POST", "/v1/wiki/_internal/summary",
+		strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "127.0.0.1:1234"
+	rec := httptest.NewRecorder()
+	InitRouter(mgrs).ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestPostSummary_RejectsMissingBasedOn(t *testing.T) {
+	_, mgrs := setupInternalTest(t)
+	rootID := "r"
+	require.NoError(t, mgrs.Nodes.Upsert(repo.WikiNode{
+		ID: "n", RootID: &rootID, Path: "/x", Level: "project", UpdatedAt: 1,
+	}))
+	body := `{"path":"/x","ai_label":"X","summary":"x","generator_version":"v"}`
+	req := httptest.NewRequest("POST", "/v1/wiki/_internal/summary",
+		strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "127.0.0.1:1234"
+	rec := httptest.NewRecorder()
+	InitRouter(mgrs).ServeHTTP(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
 }
