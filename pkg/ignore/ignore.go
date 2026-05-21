@@ -14,21 +14,69 @@ type Matcher struct {
 	containerSet map[string]struct{}
 }
 
-// New constructs a Matcher from a list of container directory basenames
-// (e.g. "node_modules", ".git", "venv"). Container dirs are rolled up into a
-// single opaque child-map entry instead of being descended.
+// baselineContainerDirs are basenames that are ALWAYS treated as opaque
+// container dirs, regardless of user configuration. These are well-known
+// NAS / OS / app artifacts that never contain user-authored content the
+// wiki should index:
+//
+//   - Synology system: @eaDir (indexer), #recycle (trash), @__thumb (thumbnails)
+//   - macOS metadata: .AppleDouble, .fseventsd, .Spotlight-V100, .Trashes,
+//     .DocumentRevisions-V100, __MACOSX (zip resource forks),
+//     Network Trash Folder, Temporary Items
+//   - Filesystem internals: lost+found (ext), .snapshots (btrfs/zfs)
+//   - Linux freedesktop trash: .Trash-* (matched by prefix, see baselineContainerDirPrefixes)
+//   - App data dirs: immich (Immich photo service data — has its own UI)
+//
+// If you genuinely want one of these indexed (e.g., archiving Immich data
+// into the wiki), open a discussion — the baseline is intentionally
+// non-configurable to keep noise out of every NimoOS install by default.
+var baselineContainerDirs = []string{
+	"@eaDir", "#recycle", "@__thumb",
+	".AppleDouble", ".fseventsd", ".Spotlight-V100", ".Trashes",
+	".DocumentRevisions-V100", "__MACOSX",
+	"Network Trash Folder", "Temporary Items",
+	"lost+found", ".snapshots",
+	"immich",
+}
+
+// baselineContainerDirPrefixes are basename PREFIXES (not full names) that are
+// always opaque. Used for variable-suffix conventions like Linux freedesktop
+// trash dirs `.Trash-{uid}` (`.Trash-1000`, `.Trash-1001`, ...). Prefix match
+// only applies to baseline; user-configured ContainerDirs are still exact.
+var baselineContainerDirPrefixes = []string{
+	".Trash-",
+}
+
+// New constructs a Matcher from a list of user-configured container directory
+// basenames (e.g. "node_modules", ".git", "venv") merged with the built-in
+// baseline of NAS / OS noise dirs (see baselineContainerDirs). User config
+// can only ADD to the opaque set; it can't remove baseline entries.
 func New(containerDirs []string) *Matcher {
-	m := &Matcher{containerSet: make(map[string]struct{}, len(containerDirs))}
+	m := &Matcher{
+		containerSet: make(map[string]struct{}, len(containerDirs)+len(baselineContainerDirs)),
+	}
 	for _, d := range containerDirs {
+		m.containerSet[d] = struct{}{}
+	}
+	for _, d := range baselineContainerDirs {
 		m.containerSet[d] = struct{}{}
 	}
 	return m
 }
 
 // IsContainerDir reports whether the basename matches a configured container.
+// Exact-match for user dirs + baselineContainerDirs; prefix-match for
+// baselineContainerDirPrefixes (Linux trash dirs like .Trash-1000).
 func (m *Matcher) IsContainerDir(basename string) bool {
-	_, ok := m.containerSet[basename]
-	return ok
+	if _, ok := m.containerSet[basename]; ok {
+		return true
+	}
+	for _, p := range baselineContainerDirPrefixes {
+		if strings.HasPrefix(basename, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsContainerDirPath reports whether the final segment of p is a container dir.
