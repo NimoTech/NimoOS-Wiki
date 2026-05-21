@@ -57,9 +57,11 @@ func postInternalSummary(d Deps) echo.HandlerFunc {
 		}
 
 		now := time.Now().UnixMilli()
-		if err := d.Nodes.SetAILabel(b.Path, b.AILabel, now); err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-		}
+		// Upsert the summary row FIRST so WikiWriter (triggered by the
+		// dirty=1 from SetAILabel below) reads the new row when it
+		// re-renders .wiki.md. If we did SetAILabel first, the Writer
+		// could race ahead, read no summary, render blank, then clear
+		// dirty before our Upsert lands.
 		if err := d.Summaries.Upsert(repo.WikiSummary{
 			Path:                b.Path,
 			Summary:             b.Summary,
@@ -67,6 +69,9 @@ func postInternalSummary(d Deps) echo.HandlerFunc {
 			BasedOnLastModified: *b.BasedOnLastModifiedMs,
 			GeneratorVersion:    b.GeneratorVersion,
 		}); err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+		if err := d.Nodes.SetAILabel(b.Path, b.AILabel, now); err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 		}
 		return c.JSON(http.StatusOK, map[string]any{"ok": true})
