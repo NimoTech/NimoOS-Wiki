@@ -55,10 +55,22 @@ func (r *FileEventsRepo) ListUnprocessed(limit int) ([]FileEvent, error) {
 	return out, rows.Err()
 }
 
+// ListSince returns file events newer than sinceMs. An empty rootID means
+// "all roots" — used by NimoOS-Parser's WikiConsumer (a single global cursor
+// across every root) and by /v1/wiki/recent-changes when callers want a
+// global feed.
 func (r *FileEventsRepo) ListSince(rootID string, sinceMs int64, limit int) ([]FileEvent, error) {
-	rows, err := r.db.Query(`SELECT `+evCols+` FROM file_events
-		WHERE root_id = ? AND archived = 0 AND detected_at > ?
-		ORDER BY detected_at LIMIT ?`, rootID, sinceMs, limit)
+	var rows *sql.Rows
+	var err error
+	if rootID == "" {
+		rows, err = r.db.Query(`SELECT `+evCols+` FROM file_events
+			WHERE archived = 0 AND detected_at > ?
+			ORDER BY detected_at LIMIT ?`, sinceMs, limit)
+	} else {
+		rows, err = r.db.Query(`SELECT `+evCols+` FROM file_events
+			WHERE root_id = ? AND archived = 0 AND detected_at > ?
+			ORDER BY detected_at LIMIT ?`, rootID, sinceMs, limit)
+	}
 	if err != nil {
 		return nil, err
 	}
