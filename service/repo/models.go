@@ -44,14 +44,17 @@ type FileIndex struct {
 	Ext      string
 }
 
+// FileEvent serializes to snake_case JSON. NimoOS-Parser's WikiConsumer
+// (Python) reads ev["root_id"], ev["path"], ev["detected_at"] etc., so the
+// JSON tags are part of the cross-repo wire contract — don't drop them.
 type FileEvent struct {
-	ID          string
-	RootID      string
-	Path        string
-	Op          string
-	RenameTo    string
-	IsDir       bool
-	DetectedAt  int64
-	ProcessedAt int64
-	Archived    bool
+	ID          string `json:"id"`
+	RootID      string `json:"root_id"`
+	Path        string `json:"path"`
+	Op          string `json:"op"`
+	RenameTo    string `json:"rename_to"`
+	IsDir       bool   `json:"is_dir"`
+	DetectedAt  int64  `json:"detected_at"`
+	ProcessedAt int64  `json:"processed_at"`
+	Archived    bool   `json:"archived"`
 }
