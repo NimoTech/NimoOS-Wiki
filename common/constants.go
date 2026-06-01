@@ -1,7 +1,7 @@
 package common
 
 const (
-	WikiVersion = "0.1.0-alpha"
+	WikiVersion = "1.9.0-alpha1"
 
 	URLFileName = "wiki.url"
 	Localhost   = "127.0.0.1"
