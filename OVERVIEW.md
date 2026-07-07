@@ -1,6 +1,6 @@
 # NimoOS-Wiki
 
-NimoOS 的「可见长期记忆」服务 — 在用户的存储空间里维护 `.wiki.md` 导航地图，让用户和 Agent 都能直接读到「NAS 里有什么、在哪里、属于什么主题」。当前版本 `v0.1.0-alpha`。
+NimoOS 的「可见长期记忆」服务 — 在用户的存储空间里维护 `.wiki.md` 导航地图，让用户和 Agent 都能直接读到「NAS 里有什么、在哪里、属于什么主题」。当前版本 `v1.9.0-alpha1`(`common/constants.go`,随 NimoOS 全家桶统一版号)。
 
 绑定 localhost、由 Gateway 转发，API 前缀 `/v1/wiki`。详细设计见 [`nimo_os_docs/docs/superpowers/specs/2026-05-13-wiki-design.md`](../nimo_os_docs/docs/superpowers/specs/2026-05-13-wiki-design.md)。
 
@@ -35,7 +35,7 @@ NimoOS 的「可见长期记忆」服务 — 在用户的存储空间里维护 `
                Wiki:RecentChanged / ...)
 ```
 
-Wiki 只做**导航地图**;**内容搜索**(向量库 / 全文索引)是接下来另开的项目,通过 `_internal` 接口对接,本服务只留 hook、不实施。
+Wiki 只做**导航地图**;**内容搜索**(向量库 / 全文索引)由 RAG 栈的其他服务实施,通过 `_internal` 接口对接。这些接口已有真实消费者:NimoOS-Parser 的 WikiConsumer 消费 `_internal/file-events`,NimoOS-AI 的 `wiki_summary_worker` 消费 `_internal/needs-summary` / `node-evidence` / `summary`,NimoOS-Search 消费 `_internal/user-roots`,详见下文「与其他服务的关系」。
 
 ---
 
@@ -65,16 +65,29 @@ Wiki 只做**导航地图**;**内容搜索**(向量库 / 全文索引)是接下�
 | GET | `/v1/wiki/node?path=...` | 读单节点(结构化 JSON,含 etag) |
 | GET | `/v1/wiki/raw?path=...` | 读原始 `.wiki.md` 文本 |
 | PUT | `/v1/wiki/user-notes?path=...` | 写 User Notes,需 `If-Match: <etag>` 乐观锁 |
-| GET | `/v1/wiki/recent-changes?root_id=&since_ms=&limit=` | 跨 Root 拉最近变化(`since_ms` 是游标,`limit` 默认 50、上限 200) |
+| GET | `/v1/wiki/recent-changes?root_id=&since_ms=&limit=` | 拉最近变化(`since_ms` 是游标,`limit` 默认 50、上限 200);**`root_id` 留空 = 跨全部 Root 的全局 feed**(2026-05-25 `FileEventsRepo.ListSince` 支持空 root_id,`service/repo/file_events.go`) |
 
 ### C 组 — 内部接口(localhost only, 不注册到 Gateway)
 
 | Method | Path | 用途 |
 |---|---|---|
-| GET | `/v1/wiki/_internal/file-events?root_id=&since=&limit=` | 给 Parser worker 拉文件变化(**本次实现**) |
-| GET | `/v1/wiki/_internal/needs-summary?limit=` | 给 AI 摘要 worker 拉待摘要节点(503 stub) |
-| POST | `/v1/wiki/_internal/summary` | AI 摘要 worker 上报摘要(503 stub) |
-| POST | `/v1/wiki/_internal/index-status` | Parser worker 上报解析状态(503 stub) |
+| GET | `/v1/wiki/_internal/file-events?root_id=&since=&limit=` | 给 Parser 的 WikiConsumer 拉文件变化;`root_id` 留空 = 跨全部 Root(Parser 用单一全局游标) |
+| GET | `/v1/wiki/_internal/needs-summary?limit=` | 给 AI 摘要 worker 拉待摘要节点队列,按 `last_modified DESC` 排序(`route/v1/internal.go`) |
+| GET | `/v1/wiki/_internal/node-evidence?path=&text_limit=&pdf_limit=` | 给摘要 worker 挑「证据」:从 `file_index` 选节点子树内的文本文件(≤50KB)/PDF(≤5MB)/直接子项/被跳过样本 |
+| POST | `/v1/wiki/_internal/summary` | 摘要 worker 上报 `{path, ai_label(≤80B), summary(≤600B), based_on_last_modified_ms}`;写 `wiki_summaries` + `SetAILabel`(顺序有讲究,见下) |
+| POST | `/v1/wiki/_internal/index-status` | Parser worker 上报解析状态(**仍是 503 stub**) |
+| GET | `/v1/wiki/_internal/user-roots?user_id=` | 给 NimoOS-Search 查用户可见的 root_id 集合;MVP 忽略 user_id、返回全部 enabled roots(前向兼容的 scope 接口) |
+
+`file-events` 返回的 `FileEvent` JSON 字段为 **snake_case**(`root_id` / `detected_at` / `is_dir` ...,`service/repo/models.go` 上有显式 tag)—— 这是与 NimoOS-Parser WikiConsumer(Python)的跨仓库 wire 契约,2026-05-25 修正,别删。
+
+### 摘要管线(2026-05-21 落地)
+
+`Summary` 段不再永远是占位符。数据流:EventProcessor 在文件事件时用 `MAX` 推进 `wiki_nodes.last_modified`(`SetDirtyAndTouch`,乱序事件不回退);NimoOS-AI 的 `wiki_summary_worker`(独立进程,见「与其他服务的关系」)轮询 `needs-summary`(条件:ai_label 为空 / 无 summary 行 / `based_on_last_modified < last_modified`)→ 用 `node-evidence` 采证据 → LLM 生成 → `POST /_internal/summary`;WikiWriter 下次 flush 时从 `wiki_summaries` 取正文渲染进 `.wiki.md` 的 `## Summary`。
+
+- **写顺序不变量**(`route/v1/internal.go` 注释):必须**先** Upsert `wiki_summaries` **再** `SetAILabel`(后者置 `dirty=1`);反过来 WikiWriter 可能抢跑读到空摘要、渲染空白后清掉 dirty。
+- **新鲜度键**是 `based_on_last_modified`(worker 生成时看到的 `last_modified` 快照),不是 `generated_at` —— 避免「生成期间文件又变了」的竞态漏摘要。
+- `SetAILabel` 故意**不动** `last_modified`(只由 EventProcessor 在真实文件事件时推进),否则会自触发无限重摘要循环(`service/repo/wiki_nodes.go`)。
+- `ai_label` 已随 `GET /node` / `GET /tree` 返回;但 `/node` 响应里的 `summary` 字段目前仍返回 `null`(`route/v1/wiki.go`),摘要正文只出现在落盘的 `.wiki.md`(经 `/raw` 可读)。
 
 ### MessageBus 事件
 
@@ -96,17 +109,17 @@ Wiki 只做**导航地图**;**内容搜索**(向量库 / 全文索引)是接下�
 | `pkg/config/` | Viper INI 配置 (`/etc/nimoos/wiki.conf`),自动写出 sample 并应用默认值 |
 | `pkg/db/` | SQLite 打开 + PRAGMAs (`WAL` / `case_sensitive_like=ON` / `busy_timeout=5000`) + migrations |
 | `pkg/pathutil/` | 大小写敏感的路径工具 (`Clean`、`IsUnder`、`Parent`) |
-| `pkg/ignore/` | 容器目录(node_modules / .git 等)+ 系统噪声忽略规则 |
+| `pkg/ignore/` | 容器目录(node_modules / .git 等)+ 系统噪声忽略规则。**内置不可配置的 baseline**:Synology `@eaDir`/`#recycle`/`@__thumb`、macOS `.AppleDouble`/`__MACOSX` 等、`lost+found`/`.snapshots`、`immich`,以及前缀匹配的 `.Trash-*`;用户配置只能增不能减 |
 | `pkg/wikimd/` | `.wiki.md` 渲染 + 解析(user-notes 区抽取) |
 | `pkg/childmap/` | Child Map 渲染:聚合 + Top-N 收敛 |
-| `service/repo/` | SQLite CRUD:wiki_roots / wiki_nodes / file_index / file_events / parse_status。**所有路径前缀 LIKE 都用 EscapeLikeArg + ESCAPE '\\'** |
-| `service/scanner/` | Watcher (fsnotify, 路径 1/2/3 分流) + Reconciler (load-to-map 对账) |
+| `service/repo/` | SQLite CRUD:wiki_roots / wiki_nodes / file_index / file_events / parse_status / **wiki_summaries**。**所有路径前缀 LIKE 都用 EscapeLikeArg + ESCAPE '\\'** |
+| `service/scanner/` | Watcher (fsnotify, 路径 1/2/3 分流) + Reconciler (load-to-map 对账;对「新近变 opaque」目录下的残留行做**静默清除**,不发 delete 事件) |
 | `service/processor/` | EventProcessor:debounce + MOVED_FROM/MOVED_TO 配对 + 目录 rename 级联 UPDATE + user-notes 反向同步 |
 | `service/writer/` | WikiWriter:Chtimes 锁 mtime + DB commit + atomic rename 的严格顺序 |
 | `service/roots/` | Root 生命周期 + 写测试 + FS 类型检测(nfs/cifs/fuse 自动降级 scan_only) |
 | `service/eventbus/` | NimoOS-Common MessageBus 包装,带 Noop fallback |
 | `route/` | JWT 中间件 + LocalhostOnly 中间件 |
-| `route/v1/` | A/B/C 三组 handlers |
+| `route/v1/` | A/B/C 三组 handlers(C 组在 `internal.go`:file-events / needs-summary / node-evidence / summary / user-roots) |
 | `tests/integration/` | E2E 集成测试 (build tag `integration`),覆盖 spec §13 全部验收项 |
 
 ---
@@ -118,10 +131,11 @@ SQLite 数据库 `/var/lib/nimoos/wiki/wiki.db` (CGO_ENABLED=1)。所有时间�
 | 表 | 用途 |
 |---|---|
 | `wiki_roots` | 已注册的 Root:path / level / watch_mode / storage_mode / enabled / scan_interval_s。每行由 `POST /v1/wiki/roots` 写入 |
-| `wiki_nodes` | **每行对应一个被显式注册的 Root**(并且**仅由 Root 注册时 seed**,见下方说明)。`user_notes` 内容直接存这里,DB 是权威源,`.wiki.md` 是渲染产物;`last_flushed_mtime` 用于 Watcher 区分「自己写的」vs「外部编辑」 |
+| `wiki_nodes` | **每行对应一个被显式注册的 Root**(并且**仅由 Root 注册时 seed**,见下方说明)。`user_notes` 内容直接存这里,DB 是权威源,`.wiki.md` 是渲染产物;`last_flushed_mtime` 用于 Watcher 区分「自己写的」vs「外部编辑」。2026-05-21 起三列有了真实维护方:`last_modified` 由 EventProcessor 在事件时 `MAX` 推进(`SetDirtyAndTouch`)、`ai_label` 由摘要 worker 经 `POST /_internal/summary` 写入、`child_count` 由 WikiWriter flush 时按 `file_index` 直接子项数回填(best-effort) |
 | `file_index` | 监控范围内的所有文件 + 容器目录占位条目;Reconciler 对账用。`is_opaque=1` 标记容器目录(node_modules 等),内部不递归 |
-| `file_events` | 统一的文件事件表(合并旧设计中的 pending_events + recent_changes)。三种消费模式:`processed_at IS NULL` 队列、`since=` 增量查询、`ORDER BY detected_at DESC` 最近变化渲染 |
-| `parse_status` | 给将来的 Parser worker 上报解析/索引状态;本服务只在 create 事件时入库 `pending`,不读 |
+| `file_events` | 统一的文件事件表(合并旧设计中的 pending_events + recent_changes)。三种消费模式:`processed_at IS NULL` 队列、`since=` 增量查询(`root_id` 可空 = 跨全部 roots)、`ORDER BY detected_at DESC` 最近变化渲染。JSON 序列化 snake_case(Parser 契约) |
+| `parse_status` | 给 Parser worker 上报解析/索引状态;本服务只在 create 事件时入库 `pending`,不读(上报端点 `index-status` 仍是 stub) |
+| `wiki_summaries` | AI 摘要正文(2026-05-21 新增):`path`(FK → wiki_nodes,ON DELETE CASCADE)/ `summary` / `generated_at` / `based_on_last_modified` / `generator_version`。`ai_label` 不在这里 —— 那存 `wiki_nodes` |
 
 **关于 wiki_node 的产生(很容易踩坑的点):**
 
@@ -234,7 +248,10 @@ go test -tags integration ./tests/...      # E2E (~10s,涉及 fsnotify)
 - **依赖 Gateway**:启动时通过 `POST /v1/gateway/routes` 注册 `/v1/wiki` 和 `/doc/v1/wiki`。
 - **依赖 LocalStorage**(可选):`GET /v1/wiki/candidates` 时从 `/var/run/nimoos/local-storage.url` 读地址,调 `GET /v1/storage` 列挂载点。不可用时返回空列表。
 - **依赖 MessageBus**:通过 Unix socket `/tmp/message-bus.sock` 发 `Wiki:*` 事件;不可用时静默降级,不影响主流程。
-- **被 NimoOS-AI 间接依赖**(规划):Agent 通过 Wiki 定位用户数据的「主题地图」,再决定要不要进一步检索具体内容(下一步项目)。
+- **被 NimoOS-Parser 消费**:Parser 的 WikiConsumer(`NimoOS-Parser/parser/wiki_consumer.py`)用单一全局游标轮询 `_internal/file-events?root_id=`(空 = 全部 roots),驱动 docling 解析 + 向量索引。`FileEvent` 的 snake_case JSON tag 是这条链路的 wire 契约。
+- **被 NimoOS-AI 的摘要 worker 消费**:`NimoOS-AI/wiki_summary_worker/`(Python,独立进程)由 systemd timer `nimoos-wiki-summary.timer` 驱动(`OnUnitInactiveSec=5min`),每轮走 needs-summary → node-evidence → LLM(经 nimoos-ai 的 `/v1/ai/_internal/chat/completions`)→ POST summary。配置读 `/etc/nimoos/wiki.conf` 的 `[wiki-summary]` 段(`Enabled` / `BatchSize` 默认 3 / `MaxPerHour` 默认 100 / `Model` 等)。**注意资源开销**:每轮都可能触发 LLM 推理;若走本地 Ollama(尤其 CPU-only 机器)会周期性吃满算力 —— 可用 `[wiki-summary] Enabled=false` 或直接 `systemctl disable --now nimoos-wiki-summary.timer` 关掉,Wiki 服务本身不受影响(Summary 段保持占位符)。
+- **被 NimoOS-Search 消费**:Search 调 `_internal/user-roots` 拿用户可见的 root 范围(直连 `wiki.url`,不走 Gateway —— Gateway 封了 `/_internal/`)。
+- **被 NimoOS-AI Agent 间接依赖**:Agent 通过 Wiki 定位用户数据的「主题地图」(MCP 工具 `wiki_get_node` / `wiki_list_full_tree` / `wiki_recent_changes` 也是这条线),再决定要不要走 Search 检索具体内容。
 
 ---
 
@@ -253,7 +270,9 @@ go test -tags integration ./tests/...      # E2E (~10s,涉及 fsnotify)
 
 5. **大目录聚合 vs 容器目录跳过是两件事**。容器目录(node_modules)整体不索引、Child Map 只显示一行「N 个文件 (已跳过)」;**有理解价值的同质大目录**(照片夹)file_index 仍然记录每个文件(给未来向量库用),但 Child Map 渲染时按扩展名聚合("10342 个 .jpg, 124 个 .raw")。
 
-6. **不**做内容搜索。Wiki 是地图,不是证据库。所有「具体内容里哪里提到了什么」的查询走未来的搜索服务(Parser 解析 + 全文/向量索引),Wiki 提供 `_internal/file-events` 接口给 Parser worker 消费文件变化流。
+6. **不**做内容搜索。Wiki 是地图,不是证据库。所有「具体内容里哪里提到了什么」的查询走 NimoOS-Search / NimoOS-Parser(解析 + 全文/向量索引),Wiki 只提供 `_internal/file-events`(事件流)和 `_internal/user-roots`(范围)两个喂料接口。
+
+7. **Reconciler 的静默清除是单向的**(`service/scanner/reconciler.go`)。当某目录**新近**被认定为 opaque(如 baseline 加入了 `immich`),其下已索引的 `file_index` 残留行会被直接删除、**不发 delete 事件** —— 避免一次 baseline 变更把 Recent Changes 刷屏。反过来,用户真删掉一个 opaque 目录时,delete 事件照常全量发出(下游缓存失效需要看到),噪声是有意接受的取舍。
 
 ---
 
@@ -261,15 +280,15 @@ go test -tags integration ./tests/...      # E2E (~10s,涉及 fsnotify)
 
 详见 spec §12「待将来项目接续的开放事项」:
 
-1. **AI 摘要 Worker** — `Summary` 和 `Key Sources` 段当前是占位符 `_暂未生成_`;按文件类型设计 Skill(markdown / pdf / 源码 / 图集 / 视频...)是单独项目。
-2. **Parser Worker + 向量库** — `parse_status` 表已建、`_internal/file-events` 已实现,等接入。
+1. **AI 摘要 Worker** — ✅ 已落地(2026-05-21,Wiki 侧三个 `_internal` 端点 + `wiki_summaries` 表;worker 在 NimoOS-AI 仓库)。`Summary` 段由 worker 生成后渲染进 `.wiki.md`;**`Key Sources` 段仍是占位符** `_暂未生成_`(`pkg/wikimd/render.go`)。`/node` API 的 `summary` 字段也仍返回 null。
+2. **Parser Worker + 向量库** — ✅ 已接入(Parser WikiConsumer 消费 `_internal/file-events`);但 `_internal/index-status` 仍是 503 stub,`parse_status` 表只写不读,Pending Index 段的计数没有真实上报方。
 3. **跨 Root 软链接** — 当前不跟随,目标若在另一个 Root 内由那个 Root 自行扫描。
 4. **NFS/CIFS 上的事件可靠性** — 自动降级为 `scan_only`,延迟取决于 `ScanIntervalSec`。
 5. **UI** — 当前没有前端,所有交互通过 API。
 
 ---
 
-## 实施现状 vs 设计 spec(2026-05-20 对齐)
+## 实施现状 vs 设计 spec(2026-07-07 对齐)
 
 为避免文档与代码漂移误导读者,这里把「设计有、代码没做(或做了一半)」的差异统一列出。修复优先级仅供参考。
 
@@ -297,7 +316,7 @@ go test -tags integration ./tests/...      # E2E (~10s,涉及 fsnotify)
 | 删 Root 目录后 wiki_node 残留 | 处理 fsnotify delete 只动 `file_index`,不动 `wiki_nodes`。删整个 Root 目录后,DB 留下一个孤儿 dirty 节点,WikiWriter 反复试写 ENOENT |
 | `mtime <= LastFlushedMtime` 判定 | 毫秒粒度下,用户编辑恰好和 WikiWriter 落盘同一毫秒 → 被当作自己的回声丢掉;低概率但非 0,网络 FS 更易触发 |
 | MessageBus 事件聚合 | **已修复 2026-05-20**:`ProcessBatch` 末尾按 `root_id` 去重发布,一次 batch 内每个 root 最多一次 `Wiki:RecentChanged` |
-| 内部接口 stub | `_internal/needs-summary` / `summary` / `index-status` 都返回 503,设计预留但 worker 接进来之前都用不了 |
+| 内部接口 stub | **大部分已于 2026-05-21/22 实装**:`needs-summary` / `summary` / `node-evidence` / `user-roots` 都是真实现;只剩 `index-status` 返回 503 |
 
 ### C. 设计与代码不一致(文档漂移)
 
@@ -312,6 +331,12 @@ go test -tags integration ./tests/...      # E2E (~10s,涉及 fsnotify)
 **已完成(2026-05-20):**
 - ✅ B 区:WikiWriter ↔ reverse-sync 时序、服务停机期间外部编辑、事件聚合 → 修复(详见 `nimo_os_docs/docs/superpowers/plans/2026-05-20-wiki-reliability-fixes.md`)
 - ✅ A 区:`Wiki:RootEnabled` / `Wiki:RootDisabled` 事件 → 已实施
+
+**已完成(2026-05-21 ~ 2026-05-25):**
+- ✅ 摘要管线全链路:`wiki_summaries` 表 + `needs-summary` / `node-evidence` / `summary` 三端点 + WikiWriter 渲染 Summary 段 + `last_modified` / `child_count` 维护(见上文「摘要管线」)
+- ✅ `_internal/user-roots`(给 Search 的 root 范围接口,2026-05-22)
+- ✅ Parser 契约两件套:`FileEvent` snake_case JSON tag + `ListSince` 空 root_id 跨全部 roots(2026-05-25)
+- ✅ ignore baseline(NAS/OS 噪声目录内置)+ Reconciler 对 newly-opaque 目录残留行的静默清除(2026-05-20)
 
 **还要做的(按优先级):**
 
