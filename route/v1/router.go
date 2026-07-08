@@ -3,6 +3,8 @@
 package v1
 
 import (
+	"github.com/NimoTech/NimoOS-Common/middleware"
+	"github.com/NimoTech/NimoOS-Wiki/common"
 	"github.com/NimoTech/NimoOS-Wiki/route"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
 	"github.com/NimoTech/NimoOS-Wiki/service/roots"
@@ -27,6 +29,8 @@ func InitRouter(d Deps) *echo.Echo {
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true
+
+	middleware.RegisterVersionRoute(e, common.V1APIPath+"/version", "Wiki", common.WikiVersion)
 
 	// Public group — JWT required.
 	g := e.Group("/v1/wiki")
