@@ -19,6 +19,7 @@ type Manager struct {
 	roots *repo.WikiRootsRepo
 	nodes *repo.WikiNodesRepo
 	bus   eventbus.Bus
+	watch Watch
 }
 
 func NewManager(roots *repo.WikiRootsRepo, nodes *repo.WikiNodesRepo, bus eventbus.Bus) *Manager {
@@ -27,6 +28,17 @@ func NewManager(roots *repo.WikiRootsRepo, nodes *repo.WikiNodesRepo, bus eventb
 	}
 	return &Manager{roots: roots, nodes: nodes, bus: bus}
 }
+
+// Watch is the subset of scanner.Watcher the Manager drives when roots are
+// created, deleted, enabled or disabled at runtime. Nil (tests, CLI) means
+// DB-only: the reconciler still covers the root on its next tick.
+type Watch interface {
+	Watch(rootID, rootPath string) error
+	Unwatch(rootID string)
+}
+
+// SetWatch wires the runtime fsnotify watcher (called once from main).
+func (m *Manager) SetWatch(w Watch) { m.watch = w }
 
 type CreateArgs struct {
 	Path          string
@@ -115,6 +127,12 @@ func (m *Manager) Create(args CreateArgs) (string, error) {
 		Level: args.Level, Dirty: true, UpdatedAt: now,
 	})
 
+	// Fix: previously a root created at runtime only got fsnotify after a
+	// service restart (the reconciler alone covered it, at up to 30s latency).
+	if m.watch != nil && args.WatchMode == "auto" {
+		_ = m.watch.Watch(id, args.Path)
+	}
+
 	m.bus.Publish(common.EventRootEnabled, map[string]any{
 		"root_id": id,
 		"path":    args.Path,
@@ -148,6 +166,10 @@ func (m *Manager) Delete(id string, purgeFiles bool) error {
 		return err
 	}
 
+	if m.watch != nil {
+		m.watch.Unwatch(id)
+	}
+
 	m.bus.Publish(common.EventRootDisabled, map[string]any{
 		"root_id": id,
 		"path":    root.Path,
@@ -161,6 +183,38 @@ func (m *Manager) Delete(id string, purgeFiles bool) error {
 // makes the next tick reconcile immediately.
 func (m *Manager) Rescan(id string) error {
 	return m.roots.UpdateLastScanAt(id, 0)
+}
+
+// SetEnabled flips a root's enabled flag with immediate effect: disabling
+// stops its fsnotify watcher (events for the root are discarded from now on);
+// enabling re-registers the watcher and marks the root overdue so the
+// reconciler catches up on changes made while it was disabled.
+// Returns repo.ErrNotFound for an unknown id.
+func (m *Manager) SetEnabled(id string, enabled bool) error {
+	root, err := m.roots.Get(id)
+	if err != nil {
+		return err
+	}
+	if root.Enabled == enabled {
+		return nil
+	}
+	if err := m.roots.SetEnabled(id, enabled); err != nil {
+		return err
+	}
+	payload := map[string]any{"root_id": id, "path": root.Path, "level": root.Level}
+	if enabled {
+		_ = m.roots.UpdateLastScanAt(id, 0)
+		if m.watch != nil && root.WatchMode == "auto" {
+			_ = m.watch.Watch(root.ID, root.Path)
+		}
+		m.bus.Publish(common.EventRootEnabled, payload)
+	} else {
+		if m.watch != nil {
+			m.watch.Unwatch(root.ID)
+		}
+		m.bus.Publish(common.EventRootDisabled, payload)
+	}
+	return nil
 }
 
 func writeTest(path string) error {

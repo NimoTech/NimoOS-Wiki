@@ -175,3 +175,56 @@ func TestManager_PublishesRootDisabledOnDelete(t *testing.T) {
 	require.NoError(t, mgr.Delete(id, false))
 	require.Equal(t, 1, bus.countOf("Wiki:RootDisabled"))
 }
+
+type fakeWatch struct {
+	watched   []string
+	unwatched []string
+}
+
+func (f *fakeWatch) Watch(rootID, rootPath string) error {
+	f.watched = append(f.watched, rootID)
+	return nil
+}
+func (f *fakeWatch) Unwatch(rootID string) { f.unwatched = append(f.unwatched, rootID) }
+
+func TestSetEnabled_TogglesAndDrivesWatcher(t *testing.T) {
+	m, rootsRepo := setupManager(t)
+	fw := &fakeWatch{}
+	m.SetWatch(fw)
+
+	tmp := t.TempDir()
+	id, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
+	require.NoError(t, err)
+	require.Equal(t, []string{id}, fw.watched) // Create now watches immediately
+
+	require.NoError(t, m.SetEnabled(id, false))
+	got, err := rootsRepo.Get(id)
+	require.NoError(t, err)
+	require.False(t, got.Enabled)
+	require.Equal(t, []string{id}, fw.unwatched)
+
+	require.NoError(t, m.SetEnabled(id, true))
+	got, err = rootsRepo.Get(id)
+	require.NoError(t, err)
+	require.True(t, got.Enabled)
+	require.Equal(t, int64(0), got.LastScanAt) // marked overdue for reconciler catch-up
+	require.Equal(t, []string{id, id}, fw.watched)
+
+	// same-state call is a no-op
+	require.NoError(t, m.SetEnabled(id, true))
+	require.Equal(t, []string{id, id}, fw.watched)
+
+	// unknown id
+	require.ErrorIs(t, m.SetEnabled("nope", false), repo.ErrNotFound)
+}
+
+func TestDelete_Unwatches(t *testing.T) {
+	m, _ := setupManager(t)
+	fw := &fakeWatch{}
+	m.SetWatch(fw)
+	tmp := t.TempDir()
+	id, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
+	require.NoError(t, err)
+	require.NoError(t, m.Delete(id, false))
+	require.Equal(t, []string{id}, fw.unwatched)
+}
