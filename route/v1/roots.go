@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/NimoTech/NimoOS-Wiki/service/repo"
 	"github.com/NimoTech/NimoOS-Wiki/service/roots"
 	"github.com/labstack/echo/v4"
 )
@@ -70,5 +71,24 @@ func listCandidates(d Deps) echo.HandlerFunc {
 			cands = []roots.Candidate{}
 		}
 		return c.JSON(http.StatusOK, cands)
+	}
+}
+
+func patchRoot(d Deps) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		var body struct {
+			Enabled *bool `json:"enabled"`
+		}
+		if err := c.Bind(&body); err != nil || body.Enabled == nil {
+			return echo.NewHTTPError(http.StatusBadRequest, `body must be {"enabled": <bool>}`)
+		}
+		err := d.Roots.SetEnabled(c.Param("id"), *body.Enabled)
+		switch {
+		case errors.Is(err, repo.ErrNotFound):
+			return echo.NewHTTPError(http.StatusNotFound, err.Error())
+		case err != nil:
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+		return c.NoContent(http.StatusNoContent)
 	}
 }
