@@ -87,6 +87,27 @@ func (w *Watcher) Watch(rootID, rootPath string) error {
 	})
 }
 
+// Unwatch removes a Root from the watcher. Events already in flight for paths
+// under the root are discarded because rootIDFor no longer matches; inotify
+// watches at or below the root are removed best-effort.
+func (w *Watcher) Unwatch(rootID string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	rootPath, ok := w.roots[rootID]
+	if !ok {
+		return
+	}
+	delete(w.roots, rootID)
+	if w.fsw == nil {
+		return
+	}
+	for _, p := range w.fsw.WatchList() {
+		if p == rootPath || strings.HasPrefix(p, rootPath+"/") {
+			_ = w.fsw.Remove(p)
+		}
+	}
+}
+
 // Run processes events until ctx is cancelled. Call from a goroutine.
 func (w *Watcher) Run(ctx context.Context) {
 	if w.fsw == nil {

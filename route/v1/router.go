@@ -41,6 +41,7 @@ func InitRouter(d Deps) *echo.Echo {
 	g.POST("/roots", createRoot(d))
 	g.DELETE("/roots/:id", deleteRoot(d))
 	g.POST("/roots/:id/rescan", rescanRoot(d))
+	g.PATCH("/roots/:id", patchRoot(d))
 	g.GET("/candidates", listCandidates(d))
 
 	// B: Wiki content
