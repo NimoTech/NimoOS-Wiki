@@ -158,7 +158,7 @@ func TestE2E_DirectoryRenameCascade_NoCaseLeakage(t *testing.T) {
 	all, _ := h.roots.List()
 	require.Len(t, all, 1)
 	rootID := all[0].ID
-	require.NoError(t, h.rec.Reconcile(rootID, root))
+	require.NoError(t, h.rec.Reconcile(h.ctx, rootID, root))
 	time.Sleep(300 * time.Millisecond)
 
 	// Rename ProjectA → Renamed

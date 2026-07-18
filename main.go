@@ -98,6 +98,9 @@ func main() {
 		config.Cfg.GlobalFuseHigh, config.Cfg.GlobalFuseLow)
 	mgr := roots.NewManager(rRoots, rNodes, bus)
 	rec := scanner.NewReconciler(rFiles, rEvents, ig)
+	rec.BatchSize = config.Cfg.ReconcileBatchSize
+	rec.ThrottleEvery = config.Cfg.WalkThrottleEvery
+	rec.ThrottleSleep = time.Duration(config.Cfg.WalkThrottleSleepMs) * time.Millisecond
 	wch := scanner.NewWatcher(rEvents, rNodes, ig, guard, zapLog)
 	mgr.SetWatch(wch)
 	proc := processor.New(d, rFiles, rEvents, rNodes, rParse, bus, ig, locks, guard, rRoots, zapLog)
@@ -211,7 +214,7 @@ func bootReconcile(ctx context.Context, r *repo.WikiRootsRepo, rec *scanner.Reco
 		if !root.Enabled {
 			continue
 		}
-		if err := rec.Reconcile(root.ID, root.Path); err != nil {
+		if err := rec.Reconcile(ctx, root.ID, root.Path); err != nil {
 			zapLog.Warn("reconcile failed", zap.String("path", root.Path), zap.Error(err))
 			continue
 		}
@@ -274,7 +277,7 @@ func runReconcilerLoop(ctx context.Context, r *repo.WikiRootsRepo, rec *scanner.
 				if root.LastScanAt+int64(root.ScanIntervalS)*1000 > now {
 					continue
 				}
-				if err := rec.Reconcile(root.ID, root.Path); err != nil {
+				if err := rec.Reconcile(ctx, root.ID, root.Path); err != nil {
 					zapLog.Warn("reconcile failed", zap.String("path", root.Path), zap.Error(err))
 					continue
 				}
