@@ -24,7 +24,7 @@ func setupWatcher(t *testing.T) (*Watcher, *repo.FileEventsRepo, *repo.WikiNodes
 	events := repo.NewFileEvents(d)
 	nodes := repo.NewWikiNodes(d)
 	root := t.TempDir()
-	w := NewWatcher(events, nodes, ignore.New([]string{"node_modules"}), nil)
+	w := NewWatcher(events, nodes, ignore.New([]string{"node_modules"}), nil, nil)
 	require.NoError(t, w.Watch("r", root))
 	return w, events, nodes, root
 }
@@ -223,4 +223,22 @@ func TestWatcher_ContainerDirSkipped(t *testing.T) {
 		require.NotContains(t, e.Path, filepath.Join("node_modules", "x.js"),
 			"events inside container dir must be skipped")
 	}
+}
+
+func TestWatcherDropsEventsWhileStorming(t *testing.T) {
+	w, events, _, _ := setupWatcher(t)
+
+	g := NewStormGuard(1, 0, 1000, 100)
+	g.Update(map[string]int{"root1": 2}) // backlog 2 > high 1 → storm
+	w.Guard = g
+
+	w.insertEvent("root1", "/tmp/x", "create", false)
+	// non-storming root: inserted as normal
+	w.insertEvent("root2", "/tmp/y", "create", false)
+
+	evs, err := events.ListUnprocessed(20)
+	require.NoError(t, err)
+	require.Len(t, evs, 1, "storming root's event must be dropped")
+	require.Equal(t, "root2", evs[0].RootID)
+	require.Equal(t, "/tmp/y", evs[0].Path)
 }

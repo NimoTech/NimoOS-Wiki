@@ -65,9 +65,9 @@ func newHarness(t *testing.T) (*harness, context.CancelFunc) {
 	ig := ignore.New([]string{"node_modules", ".git"})
 	h.mgr = roots.NewManager(h.roots, h.nodes, bus)
 	h.rec = scanner.NewReconciler(h.files, h.events, ig)
-	h.watch = scanner.NewWatcher(h.events, h.nodes, ig, nil)
+	h.watch = scanner.NewWatcher(h.events, h.nodes, ig, nil, nil)
 	locks := nodelock.New()
-	h.proc = processor.New(d, h.files, h.events, h.nodes, h.parse, bus, ig, locks, nil)
+	h.proc = processor.New(d, h.files, h.events, h.nodes, h.parse, bus, ig, locks, nil, h.roots, nil)
 	h.proc.SyncIn = h.watch.SyncOut
 	// 0 debounce window so tests don't wait 5s
 	h.wri = writer.NewWriter(h.nodes, h.files, h.events, bus, locks, h.summaries, 0, nil)

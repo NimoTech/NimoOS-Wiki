@@ -40,11 +40,17 @@ type Watcher struct {
 	roots map[string]string // rootID -> rootPath
 	fsw   *fsnotify.Watcher
 
+	// Guard is the two-level storm fuse (spec §4.1). When IsStorming(rootID)
+	// is true, insertEvent/backfillNewDir drop events for that root instead
+	// of inserting them — reconcile owns the truth while the fuse is open.
+	// Nil is a safe no-op: nil Guard never storms.
+	Guard *StormGuard
+
 	// SyncOut is read by the EventProcessor for user-notes reverse-sync tasks.
 	SyncOut chan UserNotesSyncTask
 }
 
-func NewWatcher(events *repo.FileEventsRepo, nodes *repo.WikiNodesRepo, ig *ignore.Matcher, log *zap.Logger) *Watcher {
+func NewWatcher(events *repo.FileEventsRepo, nodes *repo.WikiNodesRepo, ig *ignore.Matcher, guard *StormGuard, log *zap.Logger) *Watcher {
 	if log == nil {
 		log = zap.NewNop()
 	}
@@ -54,6 +60,7 @@ func NewWatcher(events *repo.FileEventsRepo, nodes *repo.WikiNodesRepo, ig *igno
 		ig:      ig,
 		log:     log,
 		roots:   map[string]string{},
+		Guard:   guard,
 		SyncOut: make(chan UserNotesSyncTask, 64),
 	}
 }
@@ -240,6 +247,9 @@ func (w *Watcher) handleWikiFile(rootID string, ev fsnotify.Event) {
 }
 
 func (w *Watcher) insertEvent(rootID, p, op string, isDir bool) {
+	if w.Guard != nil && w.Guard.IsStorming(rootID) {
+		return // fuse open: events are droppable, reconcile owns the truth
+	}
 	_ = w.events.Insert(repo.FileEvent{
 		ID: repo.NewID(), RootID: rootID, Path: p, Op: op,
 		IsDir: isDir, DetectedAt: time.Now().UnixMilli(),
@@ -283,6 +293,9 @@ func (w *Watcher) backfillNewDir(rootID, dir string) {
 	_ = filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
+		}
+		if w.Guard != nil && w.Guard.IsStorming(rootID) {
+			return filepath.SkipAll // fuse open: abandon the whole backfill, reconcile owns the truth
 		}
 		if p == dir {
 			return nil // already handled by caller

@@ -94,11 +94,13 @@ func main() {
 	bus := eventbus.New(config.Cfg.RuntimePath)
 	ig := ignore.New(config.Cfg.ContainerDirs)
 	locks := nodelock.New()
+	guard := scanner.NewStormGuard(config.Cfg.EventFuseHigh, config.Cfg.EventFuseLow,
+		config.Cfg.GlobalFuseHigh, config.Cfg.GlobalFuseLow)
 	mgr := roots.NewManager(rRoots, rNodes, bus)
 	rec := scanner.NewReconciler(rFiles, rEvents, ig)
-	wch := scanner.NewWatcher(rEvents, rNodes, ig, zapLog)
+	wch := scanner.NewWatcher(rEvents, rNodes, ig, guard, zapLog)
 	mgr.SetWatch(wch)
-	proc := processor.New(d, rFiles, rEvents, rNodes, rParse, bus, ig, locks, zapLog)
+	proc := processor.New(d, rFiles, rEvents, rNodes, rParse, bus, ig, locks, guard, rRoots, zapLog)
 	proc.SyncIn = wch.SyncOut
 	if config.Cfg.EventDebounceMs > 0 {
 		proc.EventDebounceMs = config.Cfg.EventDebounceMs

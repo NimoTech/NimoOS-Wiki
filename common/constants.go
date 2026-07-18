@@ -13,6 +13,7 @@ const (
 	// MessageBus event types
 	EventNodeUpdated    = "Wiki:NodeUpdated"
 	EventRecentChanged  = "Wiki:RecentChanged"
+	EventIndexStorm     = "Wiki:IndexStorm"
 	EventPendingChanged = "Wiki:PendingChanged"
 	EventRootEnabled    = "Wiki:RootEnabled"
 	EventRootDisabled   = "Wiki:RootDisabled"

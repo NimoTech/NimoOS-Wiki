@@ -33,6 +33,15 @@ type EventProcessor struct {
 	locks  *nodelock.Locks
 	log    *zap.Logger
 
+	// Guard is the two-level storm fuse (spec §4.1). updateFuse feeds it
+	// fresh backlog counts once per Run tick; nil disables the fuse entirely
+	// (no-op, never storming).
+	Guard *scanner.StormGuard
+	// roots is used to persist needs_reconcile at storm ENTRY, so a crash
+	// mid-storm still triggers a reconcile after restart. May be nil in
+	// tests that don't care about persistence.
+	roots *repo.WikiRootsRepo
+
 	SyncIn <-chan scanner.UserNotesSyncTask
 
 	EventDebounceMs int // default 200
@@ -52,6 +61,7 @@ type EventProcessor struct {
 func New(d *sql.DB, files *repo.FileIndexRepo, events *repo.FileEventsRepo,
 	nodes *repo.WikiNodesRepo, parse *repo.ParseStatusRepo,
 	bus eventbus.Bus, ig *ignore.Matcher, locks *nodelock.Locks,
+	guard *scanner.StormGuard, roots *repo.WikiRootsRepo,
 	log *zap.Logger) *EventProcessor {
 	if log == nil {
 		log = zap.NewNop()
@@ -65,6 +75,7 @@ func New(d *sql.DB, files *repo.FileIndexRepo, events *repo.FileEventsRepo,
 	return &EventProcessor{
 		db: d, files: files, events: events, nodes: nodes, parse: parse,
 		bus: bus, ig: ig, locks: locks, log: log, EventDebounceMs: 200,
+		Guard: guard, roots: roots,
 	}
 }
 
@@ -296,6 +307,37 @@ func (p *EventProcessor) debounce(in []repo.FileEvent, windowMs int64) []repo.Fi
 	return out
 }
 
+// updateFuse feeds fresh backlog counts into the storm guard and persists /
+// publishes transitions. Called once per Run tick (spec §4.1). Nil guard = no-op.
+func (p *EventProcessor) updateFuse() {
+	if p.Guard == nil {
+		return
+	}
+	backlogs, err := p.events.CountUnprocessedByRoot()
+	if err != nil {
+		p.log.Warn("fuse backlog count", zap.Error(err))
+		return
+	}
+	entered, exited := p.Guard.Update(backlogs)
+	for _, id := range entered {
+		if p.roots != nil {
+			// Persisted at ENTRY so a crash mid-storm still reconciles after restart.
+			if err := p.roots.SetNeedsReconcile(id, true); err != nil {
+				p.log.Warn("set needs_reconcile", zap.String("root", id), zap.Error(err))
+			}
+		}
+		p.log.Warn("event storm: fuse OPEN, dropping watcher events for root",
+			zap.String("root", id), zap.Int("backlog", backlogs[id]))
+		p.bus.Publish(common.EventIndexStorm, map[string]any{
+			"root_id": id, "state": "enter", "backlog": backlogs[id]})
+	}
+	for _, id := range exited {
+		p.log.Info("event storm: fuse closed for root", zap.String("root", id))
+		p.bus.Publish(common.EventIndexStorm, map[string]any{
+			"root_id": id, "state": "exit", "backlog": backlogs[id]})
+	}
+}
+
 // Run processes events on a timer and drains user-notes sync tasks.
 // Call from a goroutine; cancel ctx to stop.
 func (p *EventProcessor) Run(ctx context.Context, tickEvery time.Duration) {
@@ -306,6 +348,7 @@ func (p *EventProcessor) Run(ctx context.Context, tickEvery time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			p.updateFuse()
 			if err := p.ProcessBatch(ctx); err != nil {
 				p.log.Warn("ProcessBatch", zap.Error(err))
 			}
