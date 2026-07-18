@@ -10,6 +10,7 @@ import (
 
 	"github.com/NimoTech/NimoOS-Wiki/common"
 	"github.com/NimoTech/NimoOS-Wiki/pkg/db"
+	"github.com/NimoTech/NimoOS-Wiki/pkg/ignore"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
 	"github.com/stretchr/testify/require"
 )
@@ -57,20 +58,27 @@ func (f *fakeBus) lastPayload(event string) any {
 	return last
 }
 
+// setupManager builds a Manager with a nil ignore.Matcher: countDirsQuick
+// then counts every directory raw (pre-Task-7 / pre-fix-round-1 behavior),
+// which keeps tests that don't care about container-dir skipping simple.
 func setupManager(t *testing.T) (*Manager, *repo.WikiRootsRepo) {
+	return setupManagerWithIgnore(t, nil)
+}
+
+func setupManagerWithIgnore(t *testing.T, ig *ignore.Matcher) (*Manager, *repo.WikiRootsRepo) {
 	t.Helper()
 	d, err := db.Open(":memory:")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = d.Close() })
 	roots := repo.NewWikiRoots(d)
 	nodes := repo.NewWikiNodes(d)
-	return NewManager(roots, nodes, &fakeBus{}), roots
+	return NewManager(roots, nodes, &fakeBus{}, ig), roots
 }
 
 func TestCreate_WritableInlineSucceeds(t *testing.T) {
 	m, roots := setupManager(t)
 	tmp := t.TempDir()
-	id, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
+	id, _, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
 	require.NoError(t, err)
 	require.NotEmpty(t, id)
 	r, _ := roots.Get(id)
@@ -88,33 +96,33 @@ func TestCreate_NonWritableInlineFails(t *testing.T) {
 	require.NoError(t, os.Chmod(tmp, 0500))
 	defer os.Chmod(tmp, 0755)
 
-	_, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
+	_, _, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
 	require.ErrorIs(t, err, ErrPathNotWritable)
 }
 
 func TestCreate_RelativePathRejected(t *testing.T) {
 	m, _ := setupManager(t)
-	_, err := m.Create(CreateArgs{Path: "relative/path", Level: "space"})
+	_, _, err := m.Create(CreateArgs{Path: "relative/path", Level: "space"})
 	require.ErrorIs(t, err, ErrInvalidArgs)
 }
 
 func TestCreate_NonexistentPathRejected(t *testing.T) {
 	m, _ := setupManager(t)
-	_, err := m.Create(CreateArgs{Path: "/nonexistent-by-design-12345", Level: "space"})
+	_, _, err := m.Create(CreateArgs{Path: "/nonexistent-by-design-12345", Level: "space"})
 	require.ErrorIs(t, err, ErrPathNotExist)
 }
 
 func TestCreate_InvalidLevelRejected(t *testing.T) {
 	m, _ := setupManager(t)
 	tmp := t.TempDir()
-	_, err := m.Create(CreateArgs{Path: tmp, Level: "bogus"})
+	_, _, err := m.Create(CreateArgs{Path: tmp, Level: "bogus"})
 	require.ErrorIs(t, err, ErrInvalidArgs)
 }
 
 func TestCreate_DefaultsApplied(t *testing.T) {
 	m, roots := setupManager(t)
 	tmp := t.TempDir()
-	id, err := m.Create(CreateArgs{Path: tmp, Level: "project"})
+	id, _, err := m.Create(CreateArgs{Path: tmp, Level: "project"})
 	require.NoError(t, err)
 	r, _ := roots.Get(id)
 	require.Equal(t, "inline", r.StorageMode)
@@ -127,7 +135,7 @@ func TestCreate_DefaultsApplied(t *testing.T) {
 func TestDelete_RemovesNodesAndOptionallyFiles(t *testing.T) {
 	m, roots := setupManager(t)
 	tmp := t.TempDir()
-	id, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
+	id, _, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
 	require.NoError(t, err)
 
 	// Create a .wiki.md to simulate prior flushes
@@ -145,7 +153,7 @@ func TestDelete_RemovesNodesAndOptionallyFiles(t *testing.T) {
 func TestDelete_NoPurgeKeepsFiles(t *testing.T) {
 	m, _ := setupManager(t)
 	tmp := t.TempDir()
-	id, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
+	id, _, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(tmp, ".wiki.md"), []byte("x"), 0644))
 	require.NoError(t, m.Delete(id, false))
@@ -156,7 +164,7 @@ func TestDelete_NoPurgeKeepsFiles(t *testing.T) {
 func TestRescan_ZerosLastScanAt(t *testing.T) {
 	m, roots := setupManager(t)
 	tmp := t.TempDir()
-	id, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
+	id, _, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
 	require.NoError(t, err)
 	require.NoError(t, roots.UpdateLastScanAt(id, 999))
 	require.NoError(t, m.Rescan(id))
@@ -175,10 +183,10 @@ func TestManager_PublishesRootEnabledOnCreate(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = d.Close() })
 	bus := &fakeBus{}
-	mgr := NewManager(repo.NewWikiRoots(d), repo.NewWikiNodes(d), bus)
+	mgr := NewManager(repo.NewWikiRoots(d), repo.NewWikiNodes(d), bus, nil)
 
 	tmp := t.TempDir()
-	id, err := mgr.Create(CreateArgs{Path: tmp, Level: "project"})
+	id, _, err := mgr.Create(CreateArgs{Path: tmp, Level: "project"})
 	require.NoError(t, err)
 	require.NotEmpty(t, id)
 	require.Equal(t, 1, bus.countOf("Wiki:RootEnabled"))
@@ -189,10 +197,10 @@ func TestManager_PublishesRootDisabledOnDelete(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = d.Close() })
 	bus := &fakeBus{}
-	mgr := NewManager(repo.NewWikiRoots(d), repo.NewWikiNodes(d), bus)
+	mgr := NewManager(repo.NewWikiRoots(d), repo.NewWikiNodes(d), bus, nil)
 
 	tmp := t.TempDir()
-	id, err := mgr.Create(CreateArgs{Path: tmp, Level: "project"})
+	id, _, err := mgr.Create(CreateArgs{Path: tmp, Level: "project"})
 	require.NoError(t, err)
 
 	require.NoError(t, mgr.Delete(id, false))
@@ -216,7 +224,7 @@ func TestSetEnabled_TogglesAndDrivesWatcher(t *testing.T) {
 	m.SetWatch(fw)
 
 	tmp := t.TempDir()
-	id, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
+	id, _, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
 	require.NoError(t, err)
 	require.Equal(t, []string{id}, fw.watched) // Create now watches immediately
 
@@ -246,7 +254,7 @@ func TestDelete_Unwatches(t *testing.T) {
 	fw := &fakeWatch{}
 	m.SetWatch(fw)
 	tmp := t.TempDir()
-	id, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
+	id, _, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
 	require.NoError(t, err)
 	require.NoError(t, m.Delete(id, false))
 	require.Equal(t, []string{id}, fw.unwatched)
@@ -258,12 +266,12 @@ func TestDegradeToScanOnly(t *testing.T) {
 	t.Cleanup(func() { _ = d.Close() })
 	bus := &fakeBus{}
 	rootsRepo := repo.NewWikiRoots(d)
-	m := NewManager(rootsRepo, repo.NewWikiNodes(d), bus)
+	m := NewManager(rootsRepo, repo.NewWikiNodes(d), bus, nil)
 	fw := &fakeWatch{}
 	m.SetWatch(fw)
 
 	tmp := t.TempDir()
-	id, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
+	id, _, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
 	require.NoError(t, err)
 
 	m.DegradeToScanOnly(id, "watch_limit")
@@ -285,7 +293,12 @@ func TestDegradeToScanOnly(t *testing.T) {
 }
 
 func TestCreateLargeRootAutoScanOnly(t *testing.T) {
-	m, roots := setupManager(t)
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	bus := &fakeBus{}
+	roots := repo.NewWikiRoots(d)
+	m := NewManager(roots, repo.NewWikiNodes(d), bus, nil)
 	m.PrecheckDirLimit = 3
 	m.PrecheckTimeout = 2 * time.Second
 
@@ -294,12 +307,20 @@ func TestCreateLargeRootAutoScanOnly(t *testing.T) {
 		require.NoError(t, os.Mkdir(filepath.Join(tmp, fmt.Sprintf("sub%d", i)), 0755))
 	}
 
-	id, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
+	id, modeReason, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
 	require.NoError(t, err)
+	require.Equal(t, "large_root", modeReason, "create response must carry mode_reason=large_root")
 
 	r, err := roots.Get(id)
 	require.NoError(t, err)
 	require.Equal(t, "scan_only", r.WatchMode)
+
+	// Fix 3: the large_root event must carry the real root_id (previously
+	// published before the ID was allocated, so root_id was always "").
+	payload, ok := bus.lastPayload(common.EventWatchDegraded).(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, id, payload["root_id"])
+	require.Equal(t, "large_root", payload["reason"])
 }
 
 func TestCreateSmallRootStaysAuto(t *testing.T) {
@@ -314,8 +335,40 @@ func TestCreateSmallRootStaysAuto(t *testing.T) {
 		require.NoError(t, os.Mkdir(filepath.Join(tmp, fmt.Sprintf("sub%d", i)), 0755))
 	}
 
-	id, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
+	id, modeReason, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
 	require.NoError(t, err)
+	require.Equal(t, "", modeReason, "a normal create must not carry a mode_reason")
+
+	r, err := roots.Get(id)
+	require.NoError(t, err)
+	require.Equal(t, "auto", r.WatchMode)
+}
+
+// TestCreateSkipsContainerDirsInPrecheck is the Fix-1 regression test: the
+// precheck must not count (or descend into) container dirs, so a root whose
+// bulk lives under a container dir (e.g. /DATA/.system_data) is not
+// false-positived into scan_only.
+func TestCreateSkipsContainerDirsInPrecheck(t *testing.T) {
+	ig := ignore.New(nil) // baseline only — ".system_data" is in baselineContainerDirs
+	m, roots := setupManagerWithIgnore(t, ig)
+	m.PrecheckDirLimit = 5
+	m.PrecheckTimeout = 2 * time.Second
+
+	tmp := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(tmp, "sub0"), 0755))
+	require.NoError(t, os.Mkdir(filepath.Join(tmp, "sub1"), 0755))
+
+	container := filepath.Join(tmp, ".system_data")
+	require.NoError(t, os.Mkdir(container, 0755))
+	for i := 0; i < 10; i++ {
+		require.NoError(t, os.Mkdir(filepath.Join(container, fmt.Sprintf("nested%d", i)), 0755))
+	}
+
+	// Without the container-dir skip, the walk would see root+2 subdirs+
+	// .system_data+10 nested = 14 dirs, blowing past limit=5 into scan_only.
+	id, modeReason, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
+	require.NoError(t, err)
+	require.Equal(t, "", modeReason)
 
 	r, err := roots.Get(id)
 	require.NoError(t, err)
@@ -331,7 +384,7 @@ func TestCountDirsQuickTimeoutTreatedAsExceeded(t *testing.T) {
 		require.NoError(t, os.Mkdir(filepath.Join(tmp, fmt.Sprintf("sub%d", i)), 0755))
 	}
 
-	n, exceeded := countDirsQuick(tmp, 1_000_000, 0)
+	n, exceeded := countDirsQuick(tmp, 1_000_000, 0, nil)
 	require.True(t, exceeded)
 	require.Less(t, n, 1_000_000)
 }

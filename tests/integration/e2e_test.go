@@ -63,7 +63,7 @@ func newHarness(t *testing.T) (*harness, context.CancelFunc) {
 	}
 	bus := eventbus.Noop{}
 	ig := ignore.New([]string{"node_modules", ".git"})
-	h.mgr = roots.NewManager(h.roots, h.nodes, bus)
+	h.mgr = roots.NewManager(h.roots, h.nodes, bus, ig)
 	h.rec = scanner.NewReconciler(h.files, h.events, ig)
 	h.watch = scanner.NewWatcher(h.events, h.nodes, ig, nil, nil)
 	locks := nodelock.New()
@@ -103,7 +103,7 @@ func (h *harness) addRoot(t *testing.T, path string) string {
 	t.Helper()
 	// roots.Manager.Create seeds the wiki_node with Dirty=true so
 	// WikiWriter produces the initial .wiki.md without any extra prompting.
-	id, err := h.mgr.Create(roots.CreateArgs{Path: path, Level: "space"})
+	id, _, err := h.mgr.Create(roots.CreateArgs{Path: path, Level: "space"})
 	require.NoError(t, err)
 	require.NoError(t, h.watch.Watch(id, path))
 	h.startGoroutines()

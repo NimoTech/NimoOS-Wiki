@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/NimoTech/NimoOS-Wiki/common"
+	"github.com/NimoTech/NimoOS-Wiki/pkg/ignore"
 	"github.com/NimoTech/NimoOS-Wiki/service/eventbus"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
 	"github.com/NimoTech/NimoOS-Wiki/service/scanner"
@@ -21,6 +22,7 @@ type Manager struct {
 	nodes *repo.WikiNodesRepo
 	bus   eventbus.Bus
 	watch Watch
+	ig    *ignore.Matcher
 
 	// PrecheckDirLimit / PrecheckTimeout bound the size precheck run in
 	// Create (spec §4.4). Zero-value PrecheckDirLimit skips the precheck
@@ -29,11 +31,13 @@ type Manager struct {
 	PrecheckTimeout  time.Duration
 }
 
-func NewManager(roots *repo.WikiRootsRepo, nodes *repo.WikiNodesRepo, bus eventbus.Bus) *Manager {
+// NewManager wires the Manager. ig may be nil (tests) — countDirsQuick then
+// falls back to counting every directory raw, including container dirs.
+func NewManager(roots *repo.WikiRootsRepo, nodes *repo.WikiNodesRepo, bus eventbus.Bus, ig *ignore.Matcher) *Manager {
 	if bus == nil {
 		bus = eventbus.Noop{}
 	}
-	return &Manager{roots: roots, nodes: nodes, bus: bus}
+	return &Manager{roots: roots, nodes: nodes, bus: bus, ig: ig}
 }
 
 // Watch is the subset of scanner.Watcher the Manager drives when roots are
@@ -82,28 +86,29 @@ var (
 //  3. for inline storage_mode: writeTest must succeed
 //  4. FS type detection — nfs/cifs/fuse → force scan_only
 //
-// Returns the new Root ID.
-func (m *Manager) Create(args CreateArgs) (string, error) {
+// Returns the new Root ID and a modeReason: "" normally, or "large_root" when
+// the size precheck (spec §4.4) degraded watch_mode to scan_only.
+func (m *Manager) Create(args CreateArgs) (string, string, error) {
 	if !filepath.IsAbs(args.Path) {
-		return "", fmt.Errorf("%w: path must be absolute", ErrInvalidArgs)
+		return "", "", fmt.Errorf("%w: path must be absolute", ErrInvalidArgs)
 	}
 	args.Path = filepath.Clean(args.Path)
 
 	info, err := os.Stat(args.Path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", ErrPathNotExist
+			return "", "", ErrPathNotExist
 		}
-		return "", err
+		return "", "", err
 	}
 	if !info.IsDir() {
-		return "", fmt.Errorf("%w: path is not a directory", ErrInvalidArgs)
+		return "", "", fmt.Errorf("%w: path is not a directory", ErrInvalidArgs)
 	}
 
 	switch args.Level {
 	case "space", "project":
 	default:
-		return "", fmt.Errorf("%w: level must be 'space' or 'project'", ErrInvalidArgs)
+		return "", "", fmt.Errorf("%w: level must be 'space' or 'project'", ErrInvalidArgs)
 	}
 
 	if args.WatchMode == "" {
@@ -127,20 +132,21 @@ func (m *Manager) Create(args CreateArgs) (string, error) {
 	// Size precheck (spec §4.4): a root too big to even count quickly gets
 	// scan_only automatically — never rejected. Timeout counts as exceeded
 	// (a tree we can't enumerate 20k dirs of in 2s is huge or on slow storage;
-	// scan_only is the safe mode either way).
+	// scan_only is the safe mode either way). The publish is deferred until
+	// after the Root ID is allocated below, so the event carries a real root_id.
+	var precheckExceeded bool
+	var dirsCounted int
 	if args.WatchMode == "auto" && m.PrecheckDirLimit > 0 {
-		if n, exceeded := countDirsQuick(args.Path, m.PrecheckDirLimit, m.PrecheckTimeout); exceeded {
+		if n, exceeded := countDirsQuick(args.Path, m.PrecheckDirLimit, m.PrecheckTimeout, m.ig); exceeded {
 			args.WatchMode = "scan_only"
-			m.bus.Publish(common.EventWatchDegraded, map[string]any{
-				"root_id": "", "path": args.Path, "reason": "large_root",
-				"dirs_counted": n,
-			})
+			precheckExceeded = true
+			dirsCounted = n
 		}
 	}
 
 	if args.StorageMode == "inline" {
 		if err := writeTest(args.Path); err != nil {
-			return "", ErrPathNotWritable
+			return "", "", ErrPathNotWritable
 		}
 	}
 
@@ -151,7 +157,16 @@ func (m *Manager) Create(args CreateArgs) (string, error) {
 		WatchMode: args.WatchMode, StorageMode: args.StorageMode,
 		Enabled: true, ScanIntervalS: args.ScanIntervalS, CreatedAt: now,
 	}); err != nil {
-		return "", err
+		return "", "", err
+	}
+
+	modeReason := ""
+	if precheckExceeded {
+		modeReason = "large_root"
+		m.bus.Publish(common.EventWatchDegraded, map[string]any{
+			"root_id": id, "path": args.Path, "reason": "large_root",
+			"dirs_counted": dirsCounted,
+		})
 	}
 
 	// Seed an initial wiki_node for the Root itself. Mark dirty so WikiWriter
@@ -177,7 +192,7 @@ func (m *Manager) Create(args CreateArgs) (string, error) {
 		"level":   args.Level,
 	})
 
-	return id, nil
+	return id, modeReason, nil
 }
 
 // Delete removes a Root. If purgeFiles is true, also removes the .wiki.md files
@@ -267,13 +282,22 @@ func writeTest(path string) error {
 // is reached or timeout elapses (checked every 256 dirs to keep the deadline
 // check cheap). exceeded is true if the count hit limit or the walk timed
 // out before finishing — both cases mean "too big/slow to safely watch".
-func countDirsQuick(path string, limit int, timeout time.Duration) (int, bool) {
+//
+// Container dirs (spec §4.4: "跳过容器目录", e.g. /DATA/.system_data) are
+// skipped entirely — neither counted nor descended into — so their bulk
+// never false-positives an otherwise-small root into scan_only. ig may be
+// nil (tests, or callers with no matcher wired), in which case every
+// directory is counted raw.
+func countDirsQuick(path string, limit int, timeout time.Duration, ig *ignore.Matcher) (int, bool) {
 	deadline := time.Now().Add(timeout)
 	n := 0
 	timedOut := false
 	_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
 		if err != nil || !d.IsDir() {
 			return nil
+		}
+		if d.IsDir() && p != path && ig != nil && ig.IsContainerDir(filepath.Base(p)) {
+			return filepath.SkipDir
 		}
 		n++
 		if n >= limit {

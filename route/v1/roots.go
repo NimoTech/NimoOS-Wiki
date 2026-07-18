@@ -25,7 +25,7 @@ func createRoot(d Deps) echo.HandlerFunc {
 		if err := c.Bind(&body); err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
-		id, err := d.Roots.Create(body)
+		id, modeReason, err := d.Roots.Create(body)
 		switch {
 		case errors.Is(err, roots.ErrPathNotWritable):
 			return echo.NewHTTPError(http.StatusConflict, err.Error())
@@ -36,7 +36,11 @@ func createRoot(d Deps) echo.HandlerFunc {
 		case err != nil:
 			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 		}
-		return c.JSON(http.StatusCreated, map[string]string{"id": id})
+		resp := map[string]any{"id": id}
+		if modeReason != "" {
+			resp["mode_reason"] = modeReason
+		}
+		return c.JSON(http.StatusCreated, resp)
 	}
 }
 
