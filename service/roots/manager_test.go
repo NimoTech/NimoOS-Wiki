@@ -1,10 +1,12 @@
 package roots
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/NimoTech/NimoOS-Wiki/common"
 	"github.com/NimoTech/NimoOS-Wiki/pkg/db"
@@ -280,4 +282,56 @@ func TestDegradeToScanOnly(t *testing.T) {
 	// Idempotent: calling again should not error or double-publish oddly.
 	m.DegradeToScanOnly(id, "watch_limit")
 	require.Equal(t, 2, bus.countOf(common.EventWatchDegraded))
+}
+
+func TestCreateLargeRootAutoScanOnly(t *testing.T) {
+	m, roots := setupManager(t)
+	m.PrecheckDirLimit = 3
+	m.PrecheckTimeout = 2 * time.Second
+
+	tmp := t.TempDir()
+	for i := 0; i < 5; i++ {
+		require.NoError(t, os.Mkdir(filepath.Join(tmp, fmt.Sprintf("sub%d", i)), 0755))
+	}
+
+	id, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
+	require.NoError(t, err)
+
+	r, err := roots.Get(id)
+	require.NoError(t, err)
+	require.Equal(t, "scan_only", r.WatchMode)
+}
+
+func TestCreateSmallRootStaysAuto(t *testing.T) {
+	m, roots := setupManager(t)
+	// countDirsQuick's WalkDir counts the root itself, so with 2 subdirs the
+	// walk sees 3 dirs total; use limit=4 so that stays under the threshold.
+	m.PrecheckDirLimit = 4
+	m.PrecheckTimeout = 2 * time.Second
+
+	tmp := t.TempDir()
+	for i := 0; i < 2; i++ {
+		require.NoError(t, os.Mkdir(filepath.Join(tmp, fmt.Sprintf("sub%d", i)), 0755))
+	}
+
+	id, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
+	require.NoError(t, err)
+
+	r, err := roots.Get(id)
+	require.NoError(t, err)
+	require.Equal(t, "auto", r.WatchMode)
+}
+
+func TestCountDirsQuickTimeoutTreatedAsExceeded(t *testing.T) {
+	// The deadline is only re-checked every 256 dirs, so the tree needs to be
+	// big enough to reach that checkpoint before countDirsQuick can notice
+	// the (already-expired) zero timeout.
+	tmp := t.TempDir()
+	for i := 0; i < 300; i++ {
+		require.NoError(t, os.Mkdir(filepath.Join(tmp, fmt.Sprintf("sub%d", i)), 0755))
+	}
+
+	n, exceeded := countDirsQuick(tmp, 1_000_000, 0)
+	require.True(t, exceeded)
+	require.Less(t, n, 1_000_000)
 }

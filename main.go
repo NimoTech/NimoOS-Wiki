@@ -98,6 +98,8 @@ func main() {
 	guard := scanner.NewStormGuard(config.Cfg.EventFuseHigh, config.Cfg.EventFuseLow,
 		config.Cfg.GlobalFuseHigh, config.Cfg.GlobalFuseLow)
 	mgr := roots.NewManager(rRoots, rNodes, bus)
+	mgr.PrecheckDirLimit = config.Cfg.PrecheckDirLimit
+	mgr.PrecheckTimeout = time.Duration(config.Cfg.PrecheckTimeoutMs) * time.Millisecond
 	rec := scanner.NewReconciler(rFiles, rEvents, ig)
 	rec.BatchSize = config.Cfg.ReconcileBatchSize
 	rec.ThrottleEvery = config.Cfg.WalkThrottleEvery

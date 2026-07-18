@@ -21,6 +21,12 @@ type Manager struct {
 	nodes *repo.WikiNodesRepo
 	bus   eventbus.Bus
 	watch Watch
+
+	// PrecheckDirLimit / PrecheckTimeout bound the size precheck run in
+	// Create (spec §4.4). Zero-value PrecheckDirLimit skips the precheck
+	// entirely (keeps pre-Task-7 tests green); main injects both from config.
+	PrecheckDirLimit int
+	PrecheckTimeout  time.Duration
 }
 
 func NewManager(roots *repo.WikiRootsRepo, nodes *repo.WikiNodesRepo, bus eventbus.Bus) *Manager {
@@ -115,6 +121,20 @@ func (m *Manager) Create(args CreateArgs) (string, error) {
 		switch DetectFSType(args.Path) {
 		case "nfs", "nfs4", "cifs", "smb", "fuse", "fuseblk":
 			args.WatchMode = "scan_only"
+		}
+	}
+
+	// Size precheck (spec §4.4): a root too big to even count quickly gets
+	// scan_only automatically — never rejected. Timeout counts as exceeded
+	// (a tree we can't enumerate 20k dirs of in 2s is huge or on slow storage;
+	// scan_only is the safe mode either way).
+	if args.WatchMode == "auto" && m.PrecheckDirLimit > 0 {
+		if n, exceeded := countDirsQuick(args.Path, m.PrecheckDirLimit, m.PrecheckTimeout); exceeded {
+			args.WatchMode = "scan_only"
+			m.bus.Publish(common.EventWatchDegraded, map[string]any{
+				"root_id": "", "path": args.Path, "reason": "large_root",
+				"dirs_counted": n,
+			})
 		}
 	}
 
@@ -241,6 +261,31 @@ func writeTest(path string) error {
 		return err
 	}
 	return os.Remove(f)
+}
+
+// countDirsQuick walks path counting directories, stopping early once limit
+// is reached or timeout elapses (checked every 256 dirs to keep the deadline
+// check cheap). exceeded is true if the count hit limit or the walk timed
+// out before finishing — both cases mean "too big/slow to safely watch".
+func countDirsQuick(path string, limit int, timeout time.Duration) (int, bool) {
+	deadline := time.Now().Add(timeout)
+	n := 0
+	timedOut := false
+	_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		n++
+		if n >= limit {
+			return filepath.SkipAll
+		}
+		if n%256 == 0 && time.Now().After(deadline) {
+			timedOut = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return n, n >= limit || timedOut
 }
 
 // DetectFSType reads /proc/mounts and finds the FS type for the longest
