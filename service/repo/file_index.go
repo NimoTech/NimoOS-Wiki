@@ -85,6 +85,27 @@ func (r *FileIndexRepo) ListAllByRoot(rootID string) ([]FileIndex, error) {
 	return out, rows.Err()
 }
 
+// ListByRootAfter returns up to limit rows with path > afterPath, ordered by
+// path — keyset pagination for the streaming reconciler (spec §4.6).
+func (r *FileIndexRepo) ListByRootAfter(rootID, afterPath string, limit int) ([]FileIndex, error) {
+	rows, err := r.db.Query(`SELECT `+fileIndexCols+` FROM file_index
+		WHERE root_id = ? AND path > ? ORDER BY path LIMIT ?`,
+		rootID, afterPath, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FileIndex
+	for rows.Next() {
+		f, err := r.scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *f)
+	}
+	return out, rows.Err()
+}
+
 func (r *FileIndexRepo) DeleteByPath(rootID, path string) error {
 	_, err := r.db.Exec(`DELETE FROM file_index WHERE root_id = ? AND path = ?`, rootID, path)
 	return err

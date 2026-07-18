@@ -36,7 +36,7 @@ var baselineContainerDirs = []string{
 	".DocumentRevisions-V100", "__MACOSX",
 	"Network Trash Folder", "Temporary Items",
 	"lost+found", ".snapshots",
-	"immich",
+	"immich", ".system_data",
 }
 
 // baselineContainerDirPrefixes are basename PREFIXES (not full names) that are

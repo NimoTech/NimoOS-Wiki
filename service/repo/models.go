@@ -1,15 +1,16 @@
 package repo
 
 type WikiRoot struct {
-	ID            string
-	Path          string
-	Level         string
-	WatchMode     string
-	StorageMode   string
-	Enabled       bool
-	ScanIntervalS int
-	CreatedAt     int64
-	LastScanAt    int64
+	ID             string
+	Path           string
+	Level          string
+	WatchMode      string
+	StorageMode    string
+	Enabled        bool
+	ScanIntervalS  int
+	CreatedAt      int64
+	LastScanAt     int64
+	NeedsReconcile bool
 }
 
 type WikiNode struct {
