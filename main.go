@@ -136,8 +136,8 @@ func main() {
 	go wch.Run(ctx)
 	go proc.Run(ctx, 1*time.Second)
 	go wri.Run(ctx)
-	go runReconcilerLoop(ctx, rRoots, rec)
-	go runArchiveJob(ctx, rEvents, config.Cfg.RecentChangesRetentionDays)
+	go runReconcilerLoop(ctx, rRoots, rec, guard, rEvents)
+	go runArchiveJob(ctx, rEvents, rRoots, config.Cfg.RecentChangesRetentionDays, config.Cfg.EventMaxRows)
 
 	// Listener — random localhost port
 	listener, err := net.Listen("tcp", net.JoinHostPort(common.Localhost, "0"))
@@ -262,9 +262,11 @@ func listEnabled(r *repo.WikiRootsRepo) []repo.WikiRoot {
 	return out
 }
 
-// runReconcilerLoop polls each enabled Root every 30 seconds and reconciles
-// those whose LastScanAt + ScanIntervalS has elapsed.
-func runReconcilerLoop(ctx context.Context, r *repo.WikiRootsRepo, rec *scanner.Reconciler) {
+// runReconcilerLoop polls every 30 seconds and calls reconcileTick: at most
+// one needs_reconcile root is drained first (largest backlog, spec §4.2
+// staggering), then regular interval-due reconciles run.
+func runReconcilerLoop(ctx context.Context, r *repo.WikiRootsRepo, rec *scanner.Reconciler,
+	guard *scanner.StormGuard, ev *repo.FileEventsRepo) {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
 	for {
@@ -272,23 +274,65 @@ func runReconcilerLoop(ctx context.Context, r *repo.WikiRootsRepo, rec *scanner.
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			now := time.Now().UnixMilli()
-			for _, root := range listEnabled(r) {
-				if root.LastScanAt+int64(root.ScanIntervalS)*1000 > now {
-					continue
-				}
-				if err := rec.Reconcile(ctx, root.ID, root.Path); err != nil {
-					zapLog.Warn("reconcile failed", zap.String("path", root.Path), zap.Error(err))
-					continue
-				}
-				_ = r.UpdateLastScanAt(root.ID, time.Now().UnixMilli())
-			}
+			reconcileTick(ctx, r, rec, guard, ev, zapLog)
 		}
 	}
 }
 
-// runArchiveJob runs hourly: archive file_events > keepDays old, purge events > 2x keepDays old.
-func runArchiveJob(ctx context.Context, ev *repo.FileEventsRepo, keepDays int) {
+// reconcileTick is one 30s step of the reconciler loop: first drain AT MOST
+// ONE needs_reconcile root (largest backlog first, skipping storming roots —
+// spec §4.2 staggering), then run regular interval-due reconciles (also
+// skipping storming roots). Regular reconciles may be delayed while the
+// needs_reconcile queue drains; that is the intended degraded pace.
+func reconcileTick(ctx context.Context, r *repo.WikiRootsRepo, rec *scanner.Reconciler,
+	guard *scanner.StormGuard, ev *repo.FileEventsRepo, log *zap.Logger) {
+	now := time.Now().UnixMilli()
+	enabled := listEnabled(r)
+	backlogs, _ := ev.CountUnprocessedByRoot()
+
+	// 1) one needs_reconcile root per tick
+	var pick *repo.WikiRoot
+	for i := range enabled {
+		root := &enabled[i]
+		if !root.NeedsReconcile || (guard != nil && guard.IsStorming(root.ID)) {
+			continue
+		}
+		if pick == nil || backlogs[root.ID] > backlogs[pick.ID] {
+			pick = root
+		}
+	}
+	if pick != nil {
+		if err := rec.Reconcile(ctx, pick.ID, pick.Path); err != nil {
+			log.Warn("needs-reconcile failed", zap.String("path", pick.Path), zap.Error(err))
+		} else {
+			_ = r.SetNeedsReconcile(pick.ID, false)
+			_ = r.UpdateLastScanAt(pick.ID, time.Now().UnixMilli())
+		}
+	}
+
+	// 2) regular interval-due reconciles
+	for _, root := range enabled {
+		if pick != nil && root.ID == pick.ID {
+			continue
+		}
+		if guard != nil && guard.IsStorming(root.ID) {
+			continue
+		}
+		if root.LastScanAt+int64(root.ScanIntervalS)*1000 > now {
+			continue
+		}
+		if err := rec.Reconcile(ctx, root.ID, root.Path); err != nil {
+			log.Warn("reconcile failed", zap.String("path", root.Path), zap.Error(err))
+			continue // last_scan NOT updated → retried next cycle (strict-Lstat abort path)
+		}
+		_ = r.UpdateLastScanAt(root.ID, time.Now().UnixMilli())
+	}
+}
+
+// runArchiveJob runs hourly: archive file_events > keepDays old, purge events
+// > 2x keepDays old, plus the hard row cap (spec §4.2) via archiveSweep.
+func runArchiveJob(ctx context.Context, ev *repo.FileEventsRepo, roots *repo.WikiRootsRepo,
+	keepDays int, maxRows int64) {
 	if keepDays <= 0 {
 		keepDays = 90
 	}
@@ -299,10 +343,34 @@ func runArchiveJob(ctx context.Context, ev *repo.FileEventsRepo, keepDays int) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			archiveCutoff := time.Now().Add(-time.Duration(keepDays) * 24 * time.Hour).UnixMilli()
-			purgeCutoff := time.Now().Add(-time.Duration(keepDays*2) * 24 * time.Hour).UnixMilli()
-			_, _ = ev.ArchiveOlderThan(archiveCutoff)
-			_, _ = ev.PurgeOlderThan(purgeCutoff)
+			archiveSweep(ev, roots, keepDays, maxRows, zapLog)
+		}
+	}
+}
+
+// archiveSweep is one pass of the hourly retention job: age-based archive /
+// purge (existing behavior) plus the hard row cap (spec §4.2). Roots whose
+// rows were cap-purged are marked needs_reconcile — Wiki cannot know the
+// Parser cursor, so treat every capped purge as destroying unconsumed rows.
+func archiveSweep(ev *repo.FileEventsRepo, roots *repo.WikiRootsRepo,
+	keepDays int, maxRows int64, log *zap.Logger) {
+	archiveCutoff := time.Now().Add(-time.Duration(keepDays) * 24 * time.Hour).UnixMilli()
+	purgeCutoff := time.Now().Add(-time.Duration(keepDays*2) * 24 * time.Hour).UnixMilli()
+	_, _ = ev.ArchiveOlderThan(archiveCutoff)
+	_, _ = ev.PurgeOlderThan(purgeCutoff)
+	if maxRows <= 0 {
+		return
+	}
+	purged, affected, err := ev.PurgeOldestOverCap(maxRows)
+	if err != nil {
+		log.Warn("row-cap purge", zap.Error(err))
+		return
+	}
+	if purged > 0 {
+		log.Warn("file_events over row cap: purged oldest",
+			zap.Int64("purged", purged), zap.Strings("roots", affected))
+		for _, id := range affected {
+			_ = roots.SetNeedsReconcile(id, true)
 		}
 	}
 }
