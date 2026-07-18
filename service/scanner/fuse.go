@@ -59,29 +59,56 @@ func (g *StormGuard) Update(backlogs map[string]int) (entered, exited []string) 
 		total += b
 	}
 	if total > g.globalHigh {
-		g.globalSel = map[string]bool{}
-		remaining := total
-		for id := range g.perRoot { // already silenced by per-root fuse
-			remaining -= backlogs[id]
+		// Adequacy check first: if the CURRENT selection (per-root ∪
+		// globalSel) still keeps the unselected backlog under globalLow,
+		// leave it untouched. Rebuilding from scratch every tick made
+		// near-boundary roots flap in/out of globalSel purely from small
+		// backlog jitter, even when the existing selection was still
+		// perfectly adequate (spec §4.1 review finding).
+		excluded := map[string]bool{}
+		for id := range g.perRoot {
+			excluded[id] = true
 		}
-		type rb struct {
-			id string
-			b  int
+		for id := range g.globalSel {
+			excluded[id] = true
 		}
-		var rest []rb
-		for id, b := range backlogs {
-			if !g.perRoot[id] {
-				rest = append(rest, rb{id, b})
+		adequate := total
+		for id := range excluded {
+			adequate -= backlogs[id]
+		}
+		if adequate >= g.globalLow {
+			g.globalSel = map[string]bool{}
+			remaining := total
+			for id := range g.perRoot { // already silenced by per-root fuse
+				remaining -= backlogs[id]
+			}
+			type rb struct {
+				id string
+				b  int
+			}
+			var rest []rb
+			for id, b := range backlogs {
+				if !g.perRoot[id] {
+					rest = append(rest, rb{id, b})
+				}
+			}
+			// Deterministic tie-break (backlog desc, then id asc) so
+			// selection is reproducible across ticks/runs for ops/debugging.
+			sort.Slice(rest, func(i, j int) bool {
+				if rest[i].b != rest[j].b {
+					return rest[i].b > rest[j].b
+				}
+				return rest[i].id < rest[j].id
+			})
+			for _, r := range rest {
+				if remaining < g.globalLow {
+					break
+				}
+				g.globalSel[r.id] = true
+				remaining -= r.b
 			}
 		}
-		sort.Slice(rest, func(i, j int) bool { return rest[i].b > rest[j].b })
-		for _, r := range rest {
-			if remaining < g.globalLow {
-				break
-			}
-			g.globalSel[r.id] = true
-			remaining -= r.b
-		}
+		// else: existing selection still adequate — keep as-is.
 	} else if total < g.globalLow {
 		g.globalSel = map[string]bool{}
 	}
