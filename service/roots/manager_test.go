@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/NimoTech/NimoOS-Wiki/common"
 	"github.com/NimoTech/NimoOS-Wiki/pkg/db"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
 	"github.com/stretchr/testify/require"
@@ -13,13 +14,19 @@ import (
 
 type fakeBus struct {
 	mu        sync.Mutex
-	publishes []struct{ Event string }
+	publishes []struct {
+		Event   string
+		Payload any
+	}
 }
 
-func (f *fakeBus) Publish(ev string, _ any) {
+func (f *fakeBus) Publish(ev string, payload any) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.publishes = append(f.publishes, struct{ Event string }{ev})
+	f.publishes = append(f.publishes, struct {
+		Event   string
+		Payload any
+	}{ev, payload})
 }
 func (f *fakeBus) Close() error { return nil }
 func (f *fakeBus) countOf(event string) int {
@@ -32,6 +39,20 @@ func (f *fakeBus) countOf(event string) int {
 		}
 	}
 	return n
+}
+
+// lastPayload returns the payload of the most recent publish of event, or nil
+// if it was never published.
+func (f *fakeBus) lastPayload(event string) any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var last any
+	for _, p := range f.publishes {
+		if p.Event == event {
+			last = p.Payload
+		}
+	}
+	return last
 }
 
 func setupManager(t *testing.T) (*Manager, *repo.WikiRootsRepo) {
@@ -227,4 +248,36 @@ func TestDelete_Unwatches(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, m.Delete(id, false))
 	require.Equal(t, []string{id}, fw.unwatched)
+}
+
+func TestDegradeToScanOnly(t *testing.T) {
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	bus := &fakeBus{}
+	rootsRepo := repo.NewWikiRoots(d)
+	m := NewManager(rootsRepo, repo.NewWikiNodes(d), bus)
+	fw := &fakeWatch{}
+	m.SetWatch(fw)
+
+	tmp := t.TempDir()
+	id, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
+	require.NoError(t, err)
+
+	m.DegradeToScanOnly(id, "watch_limit")
+
+	r, err := rootsRepo.Get(id)
+	require.NoError(t, err)
+	require.Equal(t, "scan_only", r.WatchMode)
+	require.Contains(t, fw.unwatched, id)
+
+	require.Equal(t, 1, bus.countOf(common.EventWatchDegraded))
+	payload, ok := bus.lastPayload(common.EventWatchDegraded).(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, id, payload["root_id"])
+	require.Equal(t, "watch_limit", payload["reason"])
+
+	// Idempotent: calling again should not error or double-publish oddly.
+	m.DegradeToScanOnly(id, "watch_limit")
+	require.Equal(t, 2, bus.countOf(common.EventWatchDegraded))
 }

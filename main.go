@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -103,6 +104,9 @@ func main() {
 	rec.ThrottleSleep = time.Duration(config.Cfg.WalkThrottleSleepMs) * time.Millisecond
 	wch := scanner.NewWatcher(rEvents, rNodes, ig, guard, zapLog)
 	mgr.SetWatch(wch)
+	// Runtime watch-limit hits (new dirs created after startup) degrade the
+	// root the same way a registration-time hit below does.
+	wch.OnWatchLimit = func(rootID string) { mgr.DegradeToScanOnly(rootID, "watch_limit") }
 	proc := processor.New(d, rFiles, rEvents, rNodes, rParse, bus, ig, locks, guard, rRoots, zapLog)
 	proc.SyncIn = wch.SyncOut
 	if config.Cfg.EventDebounceMs > 0 {
@@ -127,6 +131,9 @@ func main() {
 	for _, root := range listEnabled(rRoots) {
 		if root.WatchMode == "auto" {
 			if err := wch.Watch(root.ID, root.Path); err != nil {
+				if errors.Is(err, scanner.ErrWatchLimit) {
+					mgr.DegradeToScanOnly(root.ID, "watch_limit")
+				}
 				zapLog.Warn("watch failed", zap.String("path", root.Path), zap.Error(err))
 			}
 		}

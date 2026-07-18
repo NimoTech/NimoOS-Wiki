@@ -18,4 +18,5 @@ const (
 	EventRootEnabled    = "Wiki:RootEnabled"
 	EventRootDisabled   = "Wiki:RootDisabled"
 	EventWriteFailed    = "Wiki:WriteFailed"
+	EventWatchDegraded  = "Wiki:WatchDegraded"
 )

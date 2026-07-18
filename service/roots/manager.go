@@ -13,6 +13,7 @@ import (
 	"github.com/NimoTech/NimoOS-Wiki/common"
 	"github.com/NimoTech/NimoOS-Wiki/service/eventbus"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
+	"github.com/NimoTech/NimoOS-Wiki/service/scanner"
 )
 
 type Manager struct {
@@ -39,6 +40,21 @@ type Watch interface {
 
 // SetWatch wires the runtime fsnotify watcher (called once from main).
 func (m *Manager) SetWatch(w Watch) { m.watch = w }
+
+// DegradeToScanOnly flips a root to scan_only after an inotify watch-limit
+// hit and announces it. Idempotent.
+func (m *Manager) DegradeToScanOnly(rootID, reason string) {
+	if err := m.roots.SetWatchMode(rootID, "scan_only"); err != nil {
+		return
+	}
+	if m.watch != nil {
+		m.watch.Unwatch(rootID)
+	}
+	m.bus.Publish(common.EventWatchDegraded, map[string]any{
+		"root_id": rootID, "reason": reason,
+		"hint": "raise fs.inotify.max_user_watches (recommended 524288)",
+	})
+}
 
 type CreateArgs struct {
 	Path          string
@@ -130,7 +146,9 @@ func (m *Manager) Create(args CreateArgs) (string, error) {
 	// Fix: previously a root created at runtime only got fsnotify after a
 	// service restart (the reconciler alone covered it, at up to 30s latency).
 	if m.watch != nil && args.WatchMode == "auto" {
-		_ = m.watch.Watch(id, args.Path)
+		if err := m.watch.Watch(id, args.Path); err != nil && errors.Is(err, scanner.ErrWatchLimit) {
+			m.DegradeToScanOnly(id, "watch_limit")
+		}
 	}
 
 	m.bus.Publish(common.EventRootEnabled, map[string]any{
