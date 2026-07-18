@@ -63,11 +63,11 @@ func newHarness(t *testing.T) (*harness, context.CancelFunc) {
 	}
 	bus := eventbus.Noop{}
 	ig := ignore.New([]string{"node_modules", ".git"})
-	h.mgr = roots.NewManager(h.roots, h.nodes, bus)
+	h.mgr = roots.NewManager(h.roots, h.nodes, bus, ig)
 	h.rec = scanner.NewReconciler(h.files, h.events, ig)
-	h.watch = scanner.NewWatcher(h.events, h.nodes, ig, nil)
+	h.watch = scanner.NewWatcher(h.events, h.nodes, ig, nil, nil)
 	locks := nodelock.New()
-	h.proc = processor.New(d, h.files, h.events, h.nodes, h.parse, bus, ig, locks, nil)
+	h.proc = processor.New(d, h.files, h.events, h.nodes, h.parse, bus, ig, locks, nil, h.roots, nil)
 	h.proc.SyncIn = h.watch.SyncOut
 	// 0 debounce window so tests don't wait 5s
 	h.wri = writer.NewWriter(h.nodes, h.files, h.events, bus, locks, h.summaries, 0, nil)
@@ -103,7 +103,7 @@ func (h *harness) addRoot(t *testing.T, path string) string {
 	t.Helper()
 	// roots.Manager.Create seeds the wiki_node with Dirty=true so
 	// WikiWriter produces the initial .wiki.md without any extra prompting.
-	id, err := h.mgr.Create(roots.CreateArgs{Path: path, Level: "space"})
+	id, _, err := h.mgr.Create(roots.CreateArgs{Path: path, Level: "space"})
 	require.NoError(t, err)
 	require.NoError(t, h.watch.Watch(id, path))
 	h.startGoroutines()
@@ -158,7 +158,7 @@ func TestE2E_DirectoryRenameCascade_NoCaseLeakage(t *testing.T) {
 	all, _ := h.roots.List()
 	require.Len(t, all, 1)
 	rootID := all[0].ID
-	require.NoError(t, h.rec.Reconcile(rootID, root))
+	require.NoError(t, h.rec.Reconcile(h.ctx, rootID, root))
 	time.Sleep(300 * time.Millisecond)
 
 	// Rename ProjectA → Renamed

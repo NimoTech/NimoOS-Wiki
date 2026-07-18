@@ -14,7 +14,7 @@ func TestUnwatchRemovesRootAndWatches(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = d.Close() })
 
-	w := NewWatcher(repo.NewFileEvents(d), repo.NewWikiNodes(d), ignore.New(nil), nil)
+	w := NewWatcher(repo.NewFileEvents(d), repo.NewWikiNodes(d), ignore.New(nil), nil, nil)
 	root := t.TempDir()
 	require.NoError(t, w.Watch("r1", root))
 	require.Equal(t, "r1", w.rootIDFor(root+"/sub.txt"))

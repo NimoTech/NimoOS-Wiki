@@ -22,7 +22,7 @@ func setup(t *testing.T) (*EventProcessor, *repo.FileIndexRepo, *repo.FileEvents
 	events := repo.NewFileEvents(d)
 	nodes := repo.NewWikiNodes(d)
 	parse := repo.NewParseStatus(d)
-	p := New(d, files, events, nodes, parse, nil, nil, nil, nil)
+	p := New(d, files, events, nodes, parse, nil, nil, nil, nil, nil, nil)
 	return p, files, events, nodes, d
 }
 
@@ -128,7 +128,7 @@ func TestProcessor_CreateDir_ContainerMarkedOpaque(t *testing.T) {
 	nodes := repo.NewWikiNodes(d)
 	parse := repo.NewParseStatus(d)
 	ig := ignore.New([]string{"node_modules", ".git"})
-	p := New(d, files, events, nodes, parse, nil, ig, nil, nil)
+	p := New(d, files, events, nodes, parse, nil, ig, nil, nil, nil, nil)
 
 	now := time.Now().UnixMilli()
 	require.NoError(t, events.Insert(repo.FileEvent{
@@ -255,7 +255,7 @@ func TestProcessor_RecentChangedAggregatedPerRoot(t *testing.T) {
 	nodes := repo.NewWikiNodes(d)
 	parse := repo.NewParseStatus(d)
 	bus := &fakeBus{}
-	p := New(d, files, events, nodes, parse, bus, nil, nil, nil)
+	p := New(d, files, events, nodes, parse, bus, nil, nil, nil, nil, nil)
 
 	now := time.Now().UnixMilli()
 	// 5 modifies on the same root + 3 on a second root within one batch

@@ -2,10 +2,12 @@ package scanner
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/NimoTech/NimoOS-Wiki/pkg/ignore"
@@ -13,6 +15,16 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"go.uber.org/zap"
 )
+
+// ErrWatchLimit is returned by Watch when the kernel refuses more inotify
+// watches (fs.inotify.max_user_watches exhausted). Callers should degrade
+// the root to scan_only (spec §4.3).
+var ErrWatchLimit = errors.New("inotify watch limit reached")
+
+func isWatchLimit(err error) bool {
+	return errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EMFILE) ||
+		errors.Is(err, syscall.ENFILE)
+}
 
 // UserNotesSyncTask is what the Watcher sends when it detects an external edit
 // to a node's .wiki.md (i.e., something other than WikiWriter modified it).
@@ -40,11 +52,23 @@ type Watcher struct {
 	roots map[string]string // rootID -> rootPath
 	fsw   *fsnotify.Watcher
 
+	// Guard is the two-level storm fuse (spec §4.1). When IsStorming(rootID)
+	// is true, insertEvent/backfillNewDir drop events for that root instead
+	// of inserting them — reconcile owns the truth while the fuse is open.
+	// Nil is a safe no-op: nil Guard never storms.
+	Guard *StormGuard
+
 	// SyncOut is read by the EventProcessor for user-notes reverse-sync tasks.
 	SyncOut chan UserNotesSyncTask
+
+	// OnWatchLimit is invoked (if non-nil) when a runtime fsw.Add hits the
+	// inotify watch-limit while handling a Create event for rootID. Callers
+	// should degrade the root to scan_only; the callback must be idempotent
+	// since it may fire more than once for the same root.
+	OnWatchLimit func(rootID string)
 }
 
-func NewWatcher(events *repo.FileEventsRepo, nodes *repo.WikiNodesRepo, ig *ignore.Matcher, log *zap.Logger) *Watcher {
+func NewWatcher(events *repo.FileEventsRepo, nodes *repo.WikiNodesRepo, ig *ignore.Matcher, guard *StormGuard, log *zap.Logger) *Watcher {
 	if log == nil {
 		log = zap.NewNop()
 	}
@@ -54,6 +78,7 @@ func NewWatcher(events *repo.FileEventsRepo, nodes *repo.WikiNodesRepo, ig *igno
 		ig:      ig,
 		log:     log,
 		roots:   map[string]string{},
+		Guard:   guard,
 		SyncOut: make(chan UserNotesSyncTask, 64),
 	}
 }
@@ -73,7 +98,8 @@ func (w *Watcher) Watch(rootID, rootPath string) error {
 	}
 	w.roots[rootID] = rootPath
 
-	return filepath.WalkDir(rootPath, func(p string, d os.DirEntry, err error) error {
+	var hitLimit bool
+	walkErr := filepath.WalkDir(rootPath, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -83,8 +109,22 @@ func (w *Watcher) Watch(rootID, rootPath string) error {
 		if p != rootPath && w.ig.IsContainerDir(filepath.Base(p)) {
 			return filepath.SkipDir
 		}
-		return w.fsw.Add(p)
+		if err := w.fsw.Add(p); err != nil {
+			if isWatchLimit(err) {
+				hitLimit = true
+				return filepath.SkipAll
+			}
+			w.log.Warn("fsw.Add", zap.String("path", p), zap.Error(err))
+		}
+		return nil
 	})
+	if walkErr != nil {
+		return walkErr
+	}
+	if hitLimit {
+		return ErrWatchLimit
+	}
+	return nil
 }
 
 // Unwatch removes a Root from the watcher. Events already in flight for paths
@@ -169,7 +209,9 @@ func (w *Watcher) handle(ev fsnotify.Event) {
 				w.insertEvent(rootID, ev.Name, "create", true)
 				return
 			}
-			_ = w.fsw.Add(ev.Name)
+			if err := w.fsw.Add(ev.Name); err != nil && isWatchLimit(err) && w.OnWatchLimit != nil {
+				w.OnWatchLimit(rootID)
+			}
 			// Walk the new dir to backfill events for any pre-existing
 			// descendants (cp -r, mv, tar x). fsnotify only emits Create on
 			// the dir itself; descendants need discovery via a walk.
@@ -240,6 +282,9 @@ func (w *Watcher) handleWikiFile(rootID string, ev fsnotify.Event) {
 }
 
 func (w *Watcher) insertEvent(rootID, p, op string, isDir bool) {
+	if w.Guard != nil && w.Guard.IsStorming(rootID) {
+		return // fuse open: events are droppable, reconcile owns the truth
+	}
 	_ = w.events.Insert(repo.FileEvent{
 		ID: repo.NewID(), RootID: rootID, Path: p, Op: op,
 		IsDir: isDir, DetectedAt: time.Now().UnixMilli(),
@@ -284,6 +329,9 @@ func (w *Watcher) backfillNewDir(rootID, dir string) {
 		if err != nil {
 			return nil
 		}
+		if w.Guard != nil && w.Guard.IsStorming(rootID) {
+			return filepath.SkipAll // fuse open: abandon the whole backfill, reconcile owns the truth
+		}
 		if p == dir {
 			return nil // already handled by caller
 		}
@@ -297,7 +345,11 @@ func (w *Watcher) backfillNewDir(rootID, dir string) {
 		}
 		if d.IsDir() {
 			if err := w.fsw.Add(p); err != nil {
-				w.log.Warn("backfill: fsw.Add failed", zap.String("path", p), zap.Error(err))
+				if isWatchLimit(err) && w.OnWatchLimit != nil {
+					w.OnWatchLimit(rootID)
+				} else {
+					w.log.Warn("backfill: fsw.Add failed", zap.String("path", p), zap.Error(err))
+				}
 			}
 		}
 		w.insertEvent(rootID, p, "create", d.IsDir())

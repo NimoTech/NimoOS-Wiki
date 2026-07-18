@@ -38,12 +38,13 @@ func TestMatcher_BaselineContainersAlwaysApplied(t *testing.T) {
 		"immich", "@eaDir", "#recycle", ".AppleDouble", ".fseventsd",
 		".Spotlight-V100", ".Trashes", ".DocumentRevisions-V100", "__MACOSX",
 		"Network Trash Folder", "Temporary Items",
-		"lost+found", ".snapshots", "@__thumb",
+		"lost+found", ".snapshots", "@__thumb", ".system_data",
 	} {
 		if !m.IsContainerDir(name) {
 			t.Errorf("baseline container %q should be opaque", name)
 		}
 	}
+	require.True(t, m.IsContainerDir(".system_data"))
 }
 
 func TestMatcher_UserContainersStillWork(t *testing.T) {

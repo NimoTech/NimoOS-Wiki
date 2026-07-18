@@ -23,7 +23,7 @@ func setupTestRouter(t *testing.T) (Deps, *echo.Echo) {
 	t.Cleanup(func() { _ = d.Close() })
 
 	dep := Deps{
-		Roots:     roots.NewManager(repo.NewWikiRoots(d), repo.NewWikiNodes(d), nil),
+		Roots:     roots.NewManager(repo.NewWikiRoots(d), repo.NewWikiNodes(d), nil, nil),
 		WikiRoots: repo.NewWikiRoots(d),
 		Nodes:     repo.NewWikiNodes(d),
 		Files:     repo.NewFileIndex(d),

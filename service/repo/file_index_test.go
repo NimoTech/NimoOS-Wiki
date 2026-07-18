@@ -1,12 +1,72 @@
 package repo
 
 import (
+	"sort"
 	"testing"
 	"time"
 
 	"github.com/NimoTech/NimoOS-Wiki/pkg/db"
 	"github.com/stretchr/testify/require"
 )
+
+// TestFileIndex_ListByRootAfter_KeysetPagination is the streaming
+// reconciler's dependency (spec §4.6): pages must cover every row exactly
+// once, in path order, with no skips or duplicates across page boundaries —
+// including when paths share string prefixes (e.g. "/root/a" vs
+// "/root/a/b" vs "/root/a1"), which is exactly where a naive LIKE-prefix or
+// off-by-one keyset clause would misbehave.
+func TestFileIndex_ListByRootAfter_KeysetPagination(t *testing.T) {
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	defer d.Close()
+	files := NewFileIndex(d)
+
+	rootID := "r"
+	paths := []string{
+		"/root/a1",
+		"/root/a",
+		"/root/a/b",
+		"/root/ab",
+		"/root/b",
+		"/root/a/b/c",
+		"/root/a0",
+	}
+	for _, p := range paths {
+		require.NoError(t, files.Upsert(FileIndex{
+			ID: NewID(), RootID: rootID, Path: p, Parent: "/root",
+			Status: "present", Mtime: 1,
+		}))
+	}
+	// A row in a different root must never leak into rootID's pages.
+	require.NoError(t, files.Upsert(FileIndex{
+		ID: NewID(), RootID: "other-root", Path: "/root/a", Parent: "/root", Status: "present",
+	}))
+
+	sorted := append([]string(nil), paths...)
+	sort.Strings(sorted)
+
+	var got []string
+	after := ""
+	const pageSize = 3
+	pages := 0
+	for {
+		batch, err := files.ListByRootAfter(rootID, after, pageSize)
+		require.NoError(t, err)
+		if len(batch) == 0 {
+			break
+		}
+		pages++
+		require.LessOrEqual(t, len(batch), pageSize)
+		for _, f := range batch {
+			require.Equal(t, rootID, f.RootID)
+			got = append(got, f.Path)
+		}
+		after = batch[len(batch)-1].Path
+	}
+
+	require.Equal(t, sorted, got, "keyset pagination must return every row exactly once, in path order, no skips/dupes")
+	require.Equal(t, 3, pages, "7 rows at page size 3 should take exactly 3 pages (3+3+1)")
+}
 
 func TestFileIndex_RewriteAndCaseSensitivity(t *testing.T) {
 	d := openTestDB(t)

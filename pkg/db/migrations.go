@@ -130,5 +130,8 @@ func runMigrations(d *sql.DB) error {
 	if err := addColumnIfMissing(d, "wiki_nodes", "ai_label", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return fmt.Errorf("add wiki_nodes.ai_label: %w", err)
 	}
+	if err := addColumnIfMissing(d, "wiki_roots", "needs_reconcile", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("add wiki_roots.needs_reconcile: %w", err)
+	}
 	return nil
 }

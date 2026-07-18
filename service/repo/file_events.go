@@ -166,6 +166,75 @@ func (r *FileEventsRepo) RewritePathPrefix(tx *sql.Tx, rootID, oldPrefix, newPre
 	return err
 }
 
+func (r *FileEventsRepo) CountUnprocessedByRoot() (map[string]int, error) {
+	rows, err := r.db.Query(`SELECT root_id, COUNT(*) FROM file_events
+		WHERE processed_at IS NULL GROUP BY root_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var id string
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, err
+		}
+		out[id] = n
+	}
+	return out, rows.Err()
+}
+
+func (r *FileEventsRepo) CountAll() (int64, error) {
+	var n int64
+	err := r.db.QueryRow(`SELECT COUNT(*) FROM file_events`).Scan(&n)
+	return n, err
+}
+
+// PurgeOldestOverCap deletes the oldest rows so the table holds at most
+// maxRows, and returns the distinct root_ids of the deleted rows so callers
+// can mark those roots needs_reconcile (spec §4.2: Wiki cannot know the
+// Parser consumer's cursor, so every capped purge is treated as potentially
+// destroying unconsumed rows and self-heals via reconcile).
+func (r *FileEventsRepo) PurgeOldestOverCap(maxRows int64) (int64, []string, error) {
+	total, err := r.CountAll()
+	if err != nil || total <= maxRows {
+		return 0, nil, err
+	}
+	over := total - maxRows
+	// cutoff = detected_at of the last row to delete (oldest `over` rows)
+	var cutoff int64
+	err = r.db.QueryRow(`SELECT detected_at FROM file_events
+		ORDER BY detected_at LIMIT 1 OFFSET ?`, over-1).Scan(&cutoff)
+	if err != nil {
+		return 0, nil, err
+	}
+	rows, err := r.db.Query(`SELECT DISTINCT root_id FROM file_events
+		WHERE detected_at <= ?`, cutoff)
+	if err != nil {
+		return 0, nil, err
+	}
+	var roots []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, nil, err
+		}
+		roots = append(roots, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, nil, err
+	}
+	res, err := r.db.Exec(`DELETE FROM file_events WHERE detected_at <= ?`, cutoff)
+	if err != nil {
+		return 0, nil, err
+	}
+	n, _ := res.RowsAffected()
+	return n, roots, nil
+}
+
 func nullableStr(s string) interface{} {
 	if s == "" {
 		return nil

@@ -26,6 +26,19 @@ type Config struct {
 	RecentChangesRetentionDays int
 	ShutdownFlushTimeoutSec    int
 	ContainerDirs              []string
+
+	// [throttled indexing] spec §4.1-4.6: fuses/caps/throttles bounding
+	// file_events growth on huge roots.
+	EventFuseHigh       int
+	EventFuseLow        int
+	GlobalFuseHigh      int
+	GlobalFuseLow       int
+	EventMaxRows        int64
+	WalkThrottleEvery   int
+	WalkThrottleSleepMs int
+	PrecheckDirLimit    int
+	PrecheckTimeoutMs   int
+	ReconcileBatchSize  int
 }
 
 func Init(configFile, confSample string) error {
@@ -57,6 +70,16 @@ func Init(configFile, confSample string) error {
 		RecentChangesKeep:          v.GetInt("wiki.RecentChangesKeep"),
 		RecentChangesRetentionDays: v.GetInt("wiki.RecentChangesRetentionDays"),
 		ShutdownFlushTimeoutSec:    v.GetInt("wiki.ShutdownFlushTimeoutSec"),
+		EventFuseHigh:              v.GetInt("wiki.EventFuseHigh"),
+		EventFuseLow:               v.GetInt("wiki.EventFuseLow"),
+		GlobalFuseHigh:             v.GetInt("wiki.GlobalFuseHigh"),
+		GlobalFuseLow:              v.GetInt("wiki.GlobalFuseLow"),
+		EventMaxRows:               v.GetInt64("wiki.EventMaxRows"),
+		WalkThrottleEvery:          v.GetInt("wiki.WalkThrottleEvery"),
+		WalkThrottleSleepMs:        v.GetInt("wiki.WalkThrottleSleepMs"),
+		PrecheckDirLimit:           v.GetInt("wiki.PrecheckDirLimit"),
+		PrecheckTimeoutMs:          v.GetInt("wiki.PrecheckTimeoutMs"),
+		ReconcileBatchSize:         v.GetInt("wiki.ReconcileBatchSize"),
 	}
 	if raw := v.GetString("wiki.ContainerDirs"); raw != "" {
 		for _, s := range strings.Split(raw, ",") {
@@ -103,6 +126,36 @@ func applyDefaults(c *Config) {
 	}
 	if c.ShutdownFlushTimeoutSec == 0 {
 		c.ShutdownFlushTimeoutSec = 5
+	}
+	if c.EventFuseHigh == 0 {
+		c.EventFuseHigh = 50000
+	}
+	if c.EventFuseLow == 0 {
+		c.EventFuseLow = 5000
+	}
+	if c.GlobalFuseHigh == 0 {
+		c.GlobalFuseHigh = 200000
+	}
+	if c.GlobalFuseLow == 0 {
+		c.GlobalFuseLow = 20000
+	}
+	if c.EventMaxRows == 0 {
+		c.EventMaxRows = 1000000
+	}
+	if c.WalkThrottleEvery == 0 {
+		c.WalkThrottleEvery = 1000
+	}
+	if c.WalkThrottleSleepMs == 0 {
+		c.WalkThrottleSleepMs = 50
+	}
+	if c.PrecheckDirLimit == 0 {
+		c.PrecheckDirLimit = 20000
+	}
+	if c.PrecheckTimeoutMs == 0 {
+		c.PrecheckTimeoutMs = 2000
+	}
+	if c.ReconcileBatchSize == 0 {
+		c.ReconcileBatchSize = 5000
 	}
 	if len(c.ContainerDirs) == 0 {
 		c.ContainerDirs = []string{
