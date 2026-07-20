@@ -1,9 +1,11 @@
 package repo
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/NimoTech/NimoOS-Wiki/pkg/db"
 	"github.com/stretchr/testify/require"
 )
 
@@ -57,4 +59,38 @@ func TestFileEvents_RecentForNode_CaseSensitive(t *testing.T) {
 	out, _ := r.RecentForNode("r", "/DATA/ProjectA", 10)
 	require.Len(t, out, 1)
 	require.Equal(t, "/DATA/ProjectA/x.go", out[0].Path)
+}
+
+func TestListSinceSeqPagesThroughSameMillisecond(t *testing.T) {
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	r := NewFileEvents(d)
+
+	now := time.Now().UnixMilli()
+	var batch []FileEvent
+	for i := 0; i < 300; i++ { // 同一毫秒 300 条,单页 200 装不下
+		batch = append(batch, FileEvent{
+			RootID: "r", Path: fmt.Sprintf("/f%03d", i), Op: "create", DetectedAt: now,
+		})
+	}
+	require.NoError(t, r.InsertBatch(batch))
+
+	seen := map[string]bool{}
+	sinceMs, afterSeq := int64(0), int64(0)
+	for {
+		page, err := r.ListSinceSeq("", sinceMs, afterSeq, 200)
+		require.NoError(t, err)
+		if len(page) == 0 {
+			break
+		}
+		for _, e := range page {
+			require.False(t, seen[e.Path], "duplicate %s", e.Path)
+			seen[e.Path] = true
+			require.NotZero(t, e.Seq)
+		}
+		last := page[len(page)-1]
+		sinceMs, afterSeq = last.DetectedAt, last.Seq
+	}
+	require.Len(t, seen, 300, "cursor must not skip same-millisecond events")
 }

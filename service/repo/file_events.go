@@ -86,6 +86,43 @@ func (r *FileEventsRepo) ListSince(rootID string, sinceMs int64, limit int) ([]F
 	return out, rows.Err()
 }
 
+// ListSinceSeq is keyset pagination over (detected_at, rowid): strictly after
+// the (sinceMs, afterSeq) cursor. Fixes the lost-events bug where a burst of
+// same-millisecond events (one reconciler round shares a single `now`) larger
+// than one page was skipped forever by consumers advancing a detected_at-only
+// cursor. ListSince keeps the legacy semantics for callers that don't send a
+// seq (recent-changes, old Parsers).
+func (r *FileEventsRepo) ListSinceSeq(rootID string, sinceMs, afterSeq int64, limit int) ([]FileEvent, error) {
+	q := `SELECT rowid, ` + evCols + ` FROM file_events
+		WHERE archived = 0 AND (detected_at > ? OR (detected_at = ? AND rowid > ?))`
+	args := []any{sinceMs, sinceMs, afterSeq}
+	if rootID != "" {
+		q += ` AND root_id = ?`
+		args = append(args, rootID)
+	}
+	q += ` ORDER BY detected_at, rowid LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := r.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FileEvent
+	for rows.Next() {
+		e := &FileEvent{}
+		var isDir, archived int
+		if err := rows.Scan(&e.Seq, &e.ID, &e.RootID, &e.Path, &e.Op, &e.RenameTo, &isDir,
+			&e.DetectedAt, &e.ProcessedAt, &archived); err != nil {
+			return nil, err
+		}
+		e.IsDir = isDir == 1
+		e.Archived = archived == 1
+		out = append(out, *e)
+	}
+	return out, rows.Err()
+}
+
 // PurgeByRootExceptDeletes drops a root's create/modify/rename events — moot
 // once the root is being deleted. op='delete' rows are kept: the Parser's
 // global cursor may not have consumed them yet and they are its only signal
