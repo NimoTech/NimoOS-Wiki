@@ -3,8 +3,10 @@ package processor
 import (
 	"context"
 	"database/sql"
+	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/NimoTech/NimoOS-Wiki/common"
@@ -136,6 +138,20 @@ func (p *EventProcessor) ProcessBatch(ctx context.Context) error {
 	return nil
 }
 
+// statShape fills Ext (from the path) and — when the entry is still on disk —
+// real Mtime/Size, matching exactly what reconciler pass B writes
+// (scanner/reconciler.go). Without this, the first reconcile after a create
+// sees a mtime/size mismatch and emits a spurious modify per new file, making
+// the Parser re-parse everything once. Lstat failure (already deleted, EACCES)
+// keeps the event-time Mtime; the reconciler converges it later.
+func statShape(fi *repo.FileIndex) {
+	fi.Ext = strings.ToLower(strings.TrimPrefix(filepath.Ext(fi.Path), "."))
+	if info, err := os.Lstat(fi.Path); err == nil {
+		fi.Mtime = info.ModTime().UnixMilli()
+		fi.Size = info.Size()
+	}
+}
+
 func (p *EventProcessor) process(ctx context.Context, e repo.FileEvent) error {
 	switch e.Op {
 	case "create":
@@ -143,10 +159,12 @@ func (p *EventProcessor) process(ctx context.Context, e repo.FileEvent) error {
 		if e.IsDir && p.ig != nil && p.ig.IsContainerDir(filepath.Base(e.Path)) {
 			isOpaque = true
 		}
-		if err := p.files.Upsert(repo.FileIndex{
+		fi := repo.FileIndex{
 			ID: repo.NewID(), RootID: e.RootID, Path: e.Path, Parent: pathutil.Parent(e.Path),
 			IsDir: e.IsDir, IsOpaque: isOpaque, Status: "present", Mtime: e.DetectedAt,
-		}); err != nil {
+		}
+		statShape(&fi)
+		if err := p.files.Upsert(fi); err != nil {
 			return err
 		}
 		if !e.IsDir {
@@ -177,11 +195,13 @@ func (p *EventProcessor) process(ctx context.Context, e repo.FileEvent) error {
 			if err := p.files.DeleteByPath(e.RootID, e.Path); err != nil {
 				return err
 			}
-			if err := p.files.Upsert(repo.FileIndex{
+			fi := repo.FileIndex{
 				ID: repo.NewID(), RootID: e.RootID, Path: e.RenameTo,
 				Parent: pathutil.Parent(e.RenameTo), Status: "present",
 				Mtime: e.DetectedAt,
-			}); err != nil {
+			}
+			statShape(&fi)
+			if err := p.files.Upsert(fi); err != nil {
 				return err
 			}
 			p.markNearestWikiNodeDirty(e.Path, e.DetectedAt)
