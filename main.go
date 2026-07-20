@@ -133,8 +133,11 @@ func main() {
 	for _, root := range listEnabled(rRoots) {
 		if root.WatchMode == "auto" {
 			if err := wch.Watch(root.ID, root.Path); err != nil {
-				if errors.Is(err, scanner.ErrWatchLimit) {
+				switch {
+				case errors.Is(err, scanner.ErrWatchLimit):
 					mgr.DegradeToScanOnly(root.ID, "watch_limit")
+				case errors.Is(err, scanner.ErrWatchRootFailed):
+					mgr.DegradeToScanOnly(root.ID, "watch_error")
 				}
 				zapLog.Warn("watch failed", zap.String("path", root.Path), zap.Error(err))
 			}

@@ -1,6 +1,7 @@
 package repo
 
 import (
+	"fmt"
 	"sort"
 	"testing"
 	"time"
@@ -197,4 +198,36 @@ func TestFileIndex_ListEvidence_ChildMap(t *testing.T) {
 	got, err := files.ListEvidenceChildren(rootID, "/x", 100)
 	require.NoError(t, err)
 	require.Len(t, got, 3)
+}
+
+func TestListByRootAfterPaginatesAndFiltersPresent(t *testing.T) {
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	r := NewFileIndex(d)
+
+	for i := 0; i < 25; i++ {
+		require.NoError(t, r.Upsert(FileIndex{
+			ID: NewID(), RootID: "r", Path: fmt.Sprintf("/f%02d", i),
+			Parent: "/", Status: "present",
+		}))
+	}
+	require.NoError(t, r.Upsert(FileIndex{
+		ID: NewID(), RootID: "r", Path: "/zz-gone", Parent: "/", Status: "absent",
+	}))
+
+	var got []string
+	after := ""
+	for {
+		page, err := r.ListByRootAfter("r", after, 10)
+		require.NoError(t, err)
+		if len(page) == 0 {
+			break
+		}
+		for _, f := range page {
+			got = append(got, f.Path)
+		}
+		after = page[len(page)-1].Path
+	}
+	require.Len(t, got, 25, "pagination must cover all present rows exactly once, skipping non-present")
 }

@@ -85,11 +85,13 @@ func (r *FileIndexRepo) ListAllByRoot(rootID string) ([]FileIndex, error) {
 	return out, rows.Err()
 }
 
-// ListByRootAfter returns up to limit rows with path > afterPath, ordered by
-// path — keyset pagination for the streaming reconciler (spec §4.6).
+// ListByRootAfter returns up to limit status='present' rows with path >
+// afterPath, ordered by path — keyset pagination for the streaming
+// reconciler (spec §4.6). The status filter matches ListAllByRoot; without
+// it a future non-present status would silently resurrect rows here.
 func (r *FileIndexRepo) ListByRootAfter(rootID, afterPath string, limit int) ([]FileIndex, error) {
 	rows, err := r.db.Query(`SELECT `+fileIndexCols+` FROM file_index
-		WHERE root_id = ? AND path > ? ORDER BY path LIMIT ?`,
+		WHERE root_id = ? AND status = 'present' AND path > ? ORDER BY path LIMIT ?`,
 		rootID, afterPath, limit)
 	if err != nil {
 		return nil, err

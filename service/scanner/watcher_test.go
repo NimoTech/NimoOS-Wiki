@@ -12,6 +12,7 @@ import (
 	"github.com/NimoTech/NimoOS-Wiki/pkg/ignore"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 func setupWatcher(t *testing.T) (*Watcher, *repo.FileEventsRepo, *repo.WikiNodesRepo, string) {
@@ -241,4 +242,17 @@ func TestWatcherDropsEventsWhileStorming(t *testing.T) {
 	require.Len(t, evs, 1, "storming root's event must be dropped")
 	require.Equal(t, "root2", evs[0].RootID)
 	require.Equal(t, "/tmp/y", evs[0].Path)
+}
+
+func TestWatchRootEACCESReturnsErrWatchRootFailed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("EACCES is not enforceable as root")
+	}
+	dir := t.TempDir()
+	require.NoError(t, os.Chmod(dir, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	w := NewWatcher(nil, nil, ignore.New(nil), nil, zap.NewNop())
+	err := w.Watch("r", dir)
+	require.ErrorIs(t, err, ErrWatchRootFailed)
 }

@@ -13,3 +13,15 @@ RecentChangesKeep = 20
 RecentChangesRetentionDays = 90
 ShutdownFlushTimeoutSec = 5
 ContainerDirs = node_modules,.git,__pycache__,venv,.venv,.tox,target,build,dist,.next,.nuxt,vendor,.gradle,.cargo,.cache,.idea,.vscode
+
+; --- throttled indexing (spec §4.1-4.6) ---
+EventFuseHigh = 50000
+EventFuseLow = 5000
+GlobalFuseHigh = 200000
+GlobalFuseLow = 20000
+EventMaxRows = 1000000
+WalkThrottleEvery = 1000
+WalkThrottleSleepMs = 50
+PrecheckDirLimit = 20000
+PrecheckTimeoutMs = 2000
+ReconcileBatchSize = 5000

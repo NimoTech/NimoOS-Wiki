@@ -64,9 +64,12 @@ func (m *Manager) DegradeToScanOnly(rootID, reason string) {
 	if m.watch != nil {
 		m.watch.Unwatch(rootID)
 	}
+	hint := "raise fs.inotify.max_user_watches (recommended 524288)"
+	if reason == "watch_error" {
+		hint = "check the root directory's permissions"
+	}
 	m.bus.Publish(common.EventWatchDegraded, map[string]any{
-		"root_id": rootID, "reason": reason,
-		"hint": "raise fs.inotify.max_user_watches (recommended 524288)",
+		"root_id": rootID, "reason": reason, "hint": hint,
 	})
 }
 
@@ -185,8 +188,13 @@ func (m *Manager) Create(args CreateArgs) (string, string, error) {
 	// Fix: previously a root created at runtime only got fsnotify after a
 	// service restart (the reconciler alone covered it, at up to 30s latency).
 	if m.watch != nil && args.WatchMode == "auto" {
-		if err := m.watch.Watch(id, args.Path); err != nil && errors.Is(err, scanner.ErrWatchLimit) {
-			m.DegradeToScanOnly(id, "watch_limit")
+		if err := m.watch.Watch(id, args.Path); err != nil {
+			switch {
+			case errors.Is(err, scanner.ErrWatchLimit):
+				m.DegradeToScanOnly(id, "watch_limit")
+			case errors.Is(err, scanner.ErrWatchRootFailed):
+				m.DegradeToScanOnly(id, "watch_error")
+			}
 		}
 	}
 
@@ -311,7 +319,14 @@ func (m *Manager) SetEnabled(id string, enabled bool) error {
 	if enabled {
 		_ = m.roots.UpdateLastScanAt(id, 0)
 		if m.watch != nil && root.WatchMode == "auto" {
-			_ = m.watch.Watch(root.ID, root.Path)
+			if err := m.watch.Watch(root.ID, root.Path); err != nil {
+				switch {
+				case errors.Is(err, scanner.ErrWatchLimit):
+					m.DegradeToScanOnly(root.ID, "watch_limit")
+				case errors.Is(err, scanner.ErrWatchRootFailed):
+					m.DegradeToScanOnly(root.ID, "watch_error")
+				}
+			}
 		}
 		m.bus.Publish(common.EventRootEnabled, payload)
 	} else {
