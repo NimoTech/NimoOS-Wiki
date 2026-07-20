@@ -86,6 +86,90 @@ func (r *FileEventsRepo) ListSince(rootID string, sinceMs int64, limit int) ([]F
 	return out, rows.Err()
 }
 
+// ListSinceSeq is keyset pagination over (detected_at, rowid): strictly after
+// the (sinceMs, afterSeq) cursor. Fixes the lost-events bug where a burst of
+// same-millisecond events (one reconciler round shares a single `now`) larger
+// than one page was skipped forever by consumers advancing a detected_at-only
+// cursor. ListSince keeps the legacy semantics for callers that don't send a
+// seq (recent-changes, old Parsers).
+func (r *FileEventsRepo) ListSinceSeq(rootID string, sinceMs, afterSeq int64, limit int) ([]FileEvent, error) {
+	q := `SELECT rowid, ` + evCols + ` FROM file_events
+		WHERE archived = 0 AND (detected_at > ? OR (detected_at = ? AND rowid > ?))`
+	args := []any{sinceMs, sinceMs, afterSeq}
+	if rootID != "" {
+		q += ` AND root_id = ?`
+		args = append(args, rootID)
+	}
+	q += ` ORDER BY detected_at, rowid LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := r.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FileEvent
+	for rows.Next() {
+		e := &FileEvent{}
+		var isDir, archived int
+		if err := rows.Scan(&e.Seq, &e.ID, &e.RootID, &e.Path, &e.Op, &e.RenameTo, &isDir,
+			&e.DetectedAt, &e.ProcessedAt, &archived); err != nil {
+			return nil, err
+		}
+		e.IsDir = isDir == 1
+		e.Archived = archived == 1
+		out = append(out, *e)
+	}
+	return out, rows.Err()
+}
+
+// PurgeByRootExceptDeletes drops a root's create/modify/rename events — moot
+// once the root is being deleted. op='delete' rows are kept: the Parser's
+// global cursor may not have consumed them yet and they are its only signal
+// to drop paths that vanished before the root did.
+func (r *FileEventsRepo) PurgeByRootExceptDeletes(rootID string) (int64, error) {
+	res, err := r.db.Exec(`DELETE FROM file_events WHERE root_id = ? AND op != 'delete'`, rootID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// InsertBatch inserts events in a single transaction (prepared statement) —
+// used by root-deletion cascade which may emit tens of thousands of
+// tombstones; row-at-a-time inserts would fsync per event. Fills empty IDs.
+func (r *FileEventsRepo) InsertBatch(events []FileEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare(`INSERT INTO file_events
+		(id, root_id, path, op, rename_to, is_dir, detected_at, processed_at, archived)
+		VALUES (?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	for i := range events {
+		e := &events[i]
+		if e.ID == "" {
+			e.ID = NewID()
+		}
+		if _, err := stmt.Exec(e.ID, e.RootID, e.Path, e.Op, nullableStr(e.RenameTo),
+			b2i(e.IsDir), e.DetectedAt, nullable(e.ProcessedAt), b2i(e.Archived)); err != nil {
+			_ = stmt.Close()
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	_ = stmt.Close()
+	return tx.Commit()
+}
+
 func (r *FileEventsRepo) RecentForRoot(rootID string, limit int) ([]FileEvent, error) {
 	rows, err := r.db.Query(`SELECT `+evCols+` FROM file_events
 		WHERE root_id = ? ORDER BY detected_at DESC LIMIT ?`, rootID, limit)

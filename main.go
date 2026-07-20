@@ -97,7 +97,7 @@ func main() {
 	locks := nodelock.New()
 	guard := scanner.NewStormGuard(config.Cfg.EventFuseHigh, config.Cfg.EventFuseLow,
 		config.Cfg.GlobalFuseHigh, config.Cfg.GlobalFuseLow)
-	mgr := roots.NewManager(rRoots, rNodes, bus, ig)
+	mgr := roots.NewManager(rRoots, rNodes, rFiles, rEvents, bus, ig)
 	mgr.PrecheckDirLimit = config.Cfg.PrecheckDirLimit
 	mgr.PrecheckTimeout = time.Duration(config.Cfg.PrecheckTimeoutMs) * time.Millisecond
 	rec := scanner.NewReconciler(rFiles, rEvents, ig)
@@ -117,11 +117,6 @@ func main() {
 	wri := writer.NewWriter(rNodes, rFiles, rEvents, bus, locks, rSummaries,
 		time.Duration(config.Cfg.WikiWriteDebounceSec)*time.Second, zapLog)
 
-	// Boot reconcile: replay drift BEFORE accepting traffic / starting watchers.
-	if err := bootReconcile(ctx, rRoots, rec); err != nil {
-		zapLog.Warn("boot reconcile failed (non-fatal)", zap.Error(err))
-	}
-
 	// Boot user-notes sync: pull in any .wiki.md edits the user made while the
 	// service was stopped. Must run BEFORE watchers are registered so the live
 	// path doesn't race with the disk-vs-DB comparison.
@@ -133,8 +128,11 @@ func main() {
 	for _, root := range listEnabled(rRoots) {
 		if root.WatchMode == "auto" {
 			if err := wch.Watch(root.ID, root.Path); err != nil {
-				if errors.Is(err, scanner.ErrWatchLimit) {
+				switch {
+				case errors.Is(err, scanner.ErrWatchLimit):
 					mgr.DegradeToScanOnly(root.ID, "watch_limit")
+				case errors.Is(err, scanner.ErrWatchRootFailed):
+					mgr.DegradeToScanOnly(root.ID, "watch_error")
 				}
 				zapLog.Warn("watch failed", zap.String("path", root.Path), zap.Error(err))
 			}
@@ -145,7 +143,15 @@ func main() {
 	go wch.Run(ctx)
 	go proc.Run(ctx, 1*time.Second)
 	go wri.Run(ctx)
-	go runReconcilerLoop(ctx, rRoots, rec, guard, rEvents)
+	go func() {
+		// Boot reconcile runs in the reconciler goroutine so at most one
+		// reconcile executor exists at a time (same invariant as before,
+		// minus the startup blocking).
+		if err := bootReconcile(ctx, rRoots, rec); err != nil {
+			zapLog.Warn("boot reconcile failed (non-fatal)", zap.Error(err))
+		}
+		runReconcilerLoop(ctx, rRoots, rec, guard, rEvents)
+	}()
 	go runArchiveJob(ctx, rEvents, rRoots, config.Cfg.RecentChangesRetentionDays, config.Cfg.EventMaxRows)
 
 	// Listener — random localhost port
@@ -211,20 +217,34 @@ func main() {
 	}
 }
 
-// bootReconcile reconciles each enabled Root once at startup, before
-// Ready is signaled. This catches changes that happened while the service
-// was down (Spec §6.3).
+// rootDueAtBoot decides whether a root gets the startup reconcile pass.
+// Fresh roots are skipped so a routine deploy restart doesn't re-walk every
+// root (offline drift in that short window is caught when the root becomes
+// overdue). needs_reconcile roots are left to reconcileTick's storm-aware
+// drain — one per tick, skipping storming roots — which boot must not bypass.
+func rootDueAtBoot(root repo.WikiRoot, nowMs int64) bool {
+	if !root.Enabled || root.NeedsReconcile {
+		return false
+	}
+	return root.LastScanAt == 0 || nowMs-root.LastScanAt >= int64(root.ScanIntervalS)*1000
+}
+
+// bootReconcile reconciles roots that actually need it at startup (never
+// scanned / overdue — see rootDueAtBoot). Runs in the reconciler goroutine
+// BEFORE the periodic loop, no longer blocking startup (spec §6.3's offline
+// catch-up intent is preserved for long downtime: those roots are overdue).
 func bootReconcile(ctx context.Context, r *repo.WikiRootsRepo, rec *scanner.Reconciler) error {
 	all, err := r.List()
 	if err != nil {
 		return err
 	}
+	now := time.Now().UnixMilli()
 	for _, root := range all {
-		if !root.Enabled {
+		if !rootDueAtBoot(root, now) {
 			continue
 		}
 		if err := rec.Reconcile(ctx, root.ID, root.Path); err != nil {
-			zapLog.Warn("reconcile failed", zap.String("path", root.Path), zap.Error(err))
+			zapLog.Warn("boot reconcile failed", zap.String("path", root.Path), zap.Error(err))
 			continue
 		}
 		_ = r.UpdateLastScanAt(root.ID, time.Now().UnixMilli())

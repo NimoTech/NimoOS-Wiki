@@ -106,7 +106,14 @@ func getInternalFileEvents(d Deps) echo.HandlerFunc {
 		if limit <= 0 || limit > 1000 {
 			limit = 100
 		}
-		evs, err := d.Events.ListSince(rootID, sinceMs, limit)
+		var evs []repo.FileEvent
+		var err error
+		if seqStr := c.QueryParam("after_seq"); seqStr != "" {
+			afterSeq, _ := strconv.ParseInt(seqStr, 10, 64)
+			evs, err = d.Events.ListSinceSeq(rootID, sinceMs, afterSeq, limit)
+		} else {
+			evs, err = d.Events.ListSince(rootID, sinceMs, limit)
+		}
 		if err != nil {
 			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 		}

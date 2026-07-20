@@ -3,6 +3,7 @@ package scanner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,12 @@ import (
 // watches (fs.inotify.max_user_watches exhausted). Callers should degrade
 // the root to scan_only (spec §4.3).
 var ErrWatchLimit = errors.New("inotify watch limit reached")
+
+// ErrWatchRootFailed means the root directory itself could not be watched
+// (EACCES etc. — not a watch-limit). Child-dir failures stay best-effort,
+// but a root we can't even watch must not silently sit in watch_mode=auto
+// pretending to have live events.
+var ErrWatchRootFailed = errors.New("cannot watch root directory")
 
 func isWatchLimit(err error) bool {
 	return errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EMFILE) ||
@@ -99,8 +106,12 @@ func (w *Watcher) Watch(rootID, rootPath string) error {
 	w.roots[rootID] = rootPath
 
 	var hitLimit bool
+	var rootAddErr error
 	walkErr := filepath.WalkDir(rootPath, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
+			if p == rootPath {
+				rootAddErr = err
+			}
 			return nil
 		}
 		if !d.IsDir() {
@@ -114,6 +125,9 @@ func (w *Watcher) Watch(rootID, rootPath string) error {
 				hitLimit = true
 				return filepath.SkipAll
 			}
+			if p == rootPath {
+				rootAddErr = err
+			}
 			w.log.Warn("fsw.Add", zap.String("path", p), zap.Error(err))
 		}
 		return nil
@@ -123,6 +137,9 @@ func (w *Watcher) Watch(rootID, rootPath string) error {
 	}
 	if hitLimit {
 		return ErrWatchLimit
+	}
+	if rootAddErr != nil {
+		return fmt.Errorf("%w: %v", ErrWatchRootFailed, rootAddErr)
 	}
 	return nil
 }

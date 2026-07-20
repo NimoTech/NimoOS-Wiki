@@ -27,7 +27,7 @@ func setupInternalTest(t *testing.T) (*sql.DB, Deps) {
 		Files:     repo.NewFileIndex(d),
 		Events:    repo.NewFileEvents(d),
 		Summaries: repo.NewWikiSummaries(d),
-		Roots:     roots.NewManager(repo.NewWikiRoots(d), repo.NewWikiNodes(d), nil, nil),
+		Roots:     roots.NewManager(repo.NewWikiRoots(d), repo.NewWikiNodes(d), nil, nil, nil, nil),
 	}
 }
 

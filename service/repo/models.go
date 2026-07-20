@@ -58,4 +58,8 @@ type FileEvent struct {
 	DetectedAt  int64  `json:"detected_at"`
 	ProcessedAt int64  `json:"processed_at"`
 	Archived    bool   `json:"archived"`
+	// Seq is the SQLite rowid, exposed only by ListSinceSeq for keyset
+	// pagination (same-millisecond bursts overflow a detected_at-only
+	// cursor). 0 everywhere else.
+	Seq int64 `json:"seq"`
 }

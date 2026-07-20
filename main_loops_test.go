@@ -67,6 +67,24 @@ func TestArchiveSweepEnforcesRowCap(t *testing.T) {
 	require.True(t, gB.NeedsReconcile, "rootB should be marked needs_reconcile")
 }
 
+func TestRootDueAtBoot(t *testing.T) {
+	now := time.Now().UnixMilli()
+	cases := []struct {
+		name string
+		root repo.WikiRoot
+		want bool
+	}{
+		{"never scanned", repo.WikiRoot{Enabled: true, ScanIntervalS: 600}, true},
+		{"fresh", repo.WikiRoot{Enabled: true, ScanIntervalS: 600, LastScanAt: now - 1000}, false},
+		{"overdue", repo.WikiRoot{Enabled: true, ScanIntervalS: 600, LastScanAt: now - 700_000}, true},
+		{"disabled overdue", repo.WikiRoot{Enabled: false, ScanIntervalS: 600, LastScanAt: now - 700_000}, false},
+		{"needs_reconcile is tick's job", repo.WikiRoot{Enabled: true, ScanIntervalS: 600, NeedsReconcile: true}, false},
+	}
+	for _, c := range cases {
+		require.Equal(t, c.want, rootDueAtBoot(c.root, now), c.name)
+	}
+}
+
 func TestReconcileTickDrainsOneNeedsReconcilePerTick(t *testing.T) {
 	d := openMainTestDB(t)
 	files := repo.NewFileIndex(d)

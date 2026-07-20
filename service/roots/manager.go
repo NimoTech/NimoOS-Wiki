@@ -18,11 +18,13 @@ import (
 )
 
 type Manager struct {
-	roots *repo.WikiRootsRepo
-	nodes *repo.WikiNodesRepo
-	bus   eventbus.Bus
-	watch Watch
-	ig    *ignore.Matcher
+	roots  *repo.WikiRootsRepo
+	nodes  *repo.WikiNodesRepo
+	files  *repo.FileIndexRepo
+	events *repo.FileEventsRepo
+	bus    eventbus.Bus
+	watch  Watch
+	ig     *ignore.Matcher
 
 	// PrecheckDirLimit / PrecheckTimeout bound the size precheck run in
 	// Create (spec §4.4). Zero-value PrecheckDirLimit skips the precheck
@@ -33,11 +35,13 @@ type Manager struct {
 
 // NewManager wires the Manager. ig may be nil (tests) — countDirsQuick then
 // falls back to counting every directory raw, including container dirs.
-func NewManager(roots *repo.WikiRootsRepo, nodes *repo.WikiNodesRepo, bus eventbus.Bus, ig *ignore.Matcher) *Manager {
+func NewManager(roots *repo.WikiRootsRepo, nodes *repo.WikiNodesRepo,
+	files *repo.FileIndexRepo, events *repo.FileEventsRepo,
+	bus eventbus.Bus, ig *ignore.Matcher) *Manager {
 	if bus == nil {
 		bus = eventbus.Noop{}
 	}
-	return &Manager{roots: roots, nodes: nodes, bus: bus, ig: ig}
+	return &Manager{roots: roots, nodes: nodes, files: files, events: events, bus: bus, ig: ig}
 }
 
 // Watch is the subset of scanner.Watcher the Manager drives when roots are
@@ -60,9 +64,12 @@ func (m *Manager) DegradeToScanOnly(rootID, reason string) {
 	if m.watch != nil {
 		m.watch.Unwatch(rootID)
 	}
+	hint := "raise fs.inotify.max_user_watches (recommended 524288)"
+	if reason == "watch_error" {
+		hint = "check the root directory's permissions"
+	}
 	m.bus.Publish(common.EventWatchDegraded, map[string]any{
-		"root_id": rootID, "reason": reason,
-		"hint": "raise fs.inotify.max_user_watches (recommended 524288)",
+		"root_id": rootID, "reason": reason, "hint": hint,
 	})
 }
 
@@ -181,8 +188,13 @@ func (m *Manager) Create(args CreateArgs) (string, string, error) {
 	// Fix: previously a root created at runtime only got fsnotify after a
 	// service restart (the reconciler alone covered it, at up to 30s latency).
 	if m.watch != nil && args.WatchMode == "auto" {
-		if err := m.watch.Watch(id, args.Path); err != nil && errors.Is(err, scanner.ErrWatchLimit) {
-			m.DegradeToScanOnly(id, "watch_limit")
+		if err := m.watch.Watch(id, args.Path); err != nil {
+			switch {
+			case errors.Is(err, scanner.ErrWatchLimit):
+				m.DegradeToScanOnly(id, "watch_limit")
+			case errors.Is(err, scanner.ErrWatchRootFailed):
+				m.DegradeToScanOnly(id, "watch_error")
+			}
 		}
 	}
 
@@ -213,6 +225,55 @@ func (m *Manager) Delete(id string, purgeFiles bool) error {
 	nodes, _ := m.nodes.List(id)
 	for _, n := range nodes {
 		_ = m.nodes.Delete(n.Path)
+	}
+
+	// Cascade cleanup (2026-07-20 follow-up): without this, deleting a root
+	// leaves every file_index row behind and — because the Parser only learns
+	// about removals through delete events — permanently leaks the root's
+	// records and Qdrant vectors on the Parser side.
+	if m.files != nil && m.events != nil {
+		now := time.Now().UnixMilli()
+		// 1) A dying root's pending create/modify/rename events are moot.
+		//    Its op='delete' events are kept for the Parser's cursor.
+		if _, err := m.events.PurgeByRootExceptDeletes(id); err != nil {
+			return err
+		}
+		// 2) One delete tombstone per indexed file so the Parser drops its
+		//    records (content-addressed refcounting keeps shared content
+		//    alive; real vector deletion happens after its 24h GC grace).
+		//    Pre-marked processed_at: our own processor must not re-consume
+		//    them, and they must not count as backlog for the storm fuse —
+		//    the internal file-events feed returns processed rows anyway
+		//    (ListSince filters on archived only). Same-millisecond bursts
+		//    are safe for the Parser via seq keyset pagination.
+		after := ""
+		for {
+			batch, err := m.files.ListByRootAfter(id, after, 5000)
+			if err != nil {
+				return err
+			}
+			if len(batch) == 0 {
+				break
+			}
+			evs := make([]repo.FileEvent, 0, len(batch))
+			for _, f := range batch {
+				if f.IsDir || f.Status != "present" {
+					continue
+				}
+				evs = append(evs, repo.FileEvent{
+					RootID: id, Path: f.Path, Op: "delete",
+					DetectedAt: now, ProcessedAt: now,
+				})
+			}
+			if err := m.events.InsertBatch(evs); err != nil {
+				return err
+			}
+			after = batch[len(batch)-1].Path
+		}
+		// 3) Drop the root's file_index rows.
+		if _, err := m.files.DeleteByRoot(id); err != nil {
+			return err
+		}
 	}
 
 	if err := m.roots.Delete(id); err != nil {
@@ -258,7 +319,14 @@ func (m *Manager) SetEnabled(id string, enabled bool) error {
 	if enabled {
 		_ = m.roots.UpdateLastScanAt(id, 0)
 		if m.watch != nil && root.WatchMode == "auto" {
-			_ = m.watch.Watch(root.ID, root.Path)
+			if err := m.watch.Watch(root.ID, root.Path); err != nil {
+				switch {
+				case errors.Is(err, scanner.ErrWatchLimit):
+					m.DegradeToScanOnly(root.ID, "watch_limit")
+				case errors.Is(err, scanner.ErrWatchRootFailed):
+					m.DegradeToScanOnly(root.ID, "watch_error")
+				}
+			}
 		}
 		m.bus.Publish(common.EventRootEnabled, payload)
 	} else {

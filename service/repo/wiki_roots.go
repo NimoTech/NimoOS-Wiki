@@ -41,7 +41,7 @@ func (r *WikiRootsRepo) Get(id string) (*WikiRoot, error) {
 
 func (r *WikiRootsRepo) List() ([]WikiRoot, error) {
 	rows, err := r.db.Query(`SELECT id, path, level, watch_mode, storage_mode, enabled,
-		scan_interval_s, created_at, COALESCE(last_scan_at, 0), needs_reconcile FROM wiki_roots`)
+		scan_interval_s, created_at, COALESCE(last_scan_at, 0), needs_reconcile FROM wiki_roots ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
