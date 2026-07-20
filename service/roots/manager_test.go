@@ -72,7 +72,9 @@ func setupManagerWithIgnore(t *testing.T, ig *ignore.Matcher) (*Manager, *repo.W
 	t.Cleanup(func() { _ = d.Close() })
 	roots := repo.NewWikiRoots(d)
 	nodes := repo.NewWikiNodes(d)
-	return NewManager(roots, nodes, &fakeBus{}, ig), roots
+	files := repo.NewFileIndex(d)
+	events := repo.NewFileEvents(d)
+	return NewManager(roots, nodes, files, events, &fakeBus{}, ig), roots
 }
 
 func TestCreate_WritableInlineSucceeds(t *testing.T) {
@@ -183,7 +185,7 @@ func TestManager_PublishesRootEnabledOnCreate(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = d.Close() })
 	bus := &fakeBus{}
-	mgr := NewManager(repo.NewWikiRoots(d), repo.NewWikiNodes(d), bus, nil)
+	mgr := NewManager(repo.NewWikiRoots(d), repo.NewWikiNodes(d), nil, nil, bus, nil)
 
 	tmp := t.TempDir()
 	id, _, err := mgr.Create(CreateArgs{Path: tmp, Level: "project"})
@@ -197,7 +199,7 @@ func TestManager_PublishesRootDisabledOnDelete(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = d.Close() })
 	bus := &fakeBus{}
-	mgr := NewManager(repo.NewWikiRoots(d), repo.NewWikiNodes(d), bus, nil)
+	mgr := NewManager(repo.NewWikiRoots(d), repo.NewWikiNodes(d), nil, nil, bus, nil)
 
 	tmp := t.TempDir()
 	id, _, err := mgr.Create(CreateArgs{Path: tmp, Level: "project"})
@@ -266,7 +268,7 @@ func TestDegradeToScanOnly(t *testing.T) {
 	t.Cleanup(func() { _ = d.Close() })
 	bus := &fakeBus{}
 	rootsRepo := repo.NewWikiRoots(d)
-	m := NewManager(rootsRepo, repo.NewWikiNodes(d), bus, nil)
+	m := NewManager(rootsRepo, repo.NewWikiNodes(d), nil, nil, bus, nil)
 	fw := &fakeWatch{}
 	m.SetWatch(fw)
 
@@ -298,7 +300,7 @@ func TestCreateLargeRootAutoScanOnly(t *testing.T) {
 	t.Cleanup(func() { _ = d.Close() })
 	bus := &fakeBus{}
 	roots := repo.NewWikiRoots(d)
-	m := NewManager(roots, repo.NewWikiNodes(d), bus, nil)
+	m := NewManager(roots, repo.NewWikiNodes(d), nil, nil, bus, nil)
 	m.PrecheckDirLimit = 3
 	m.PrecheckTimeout = 2 * time.Second
 
@@ -373,6 +375,53 @@ func TestCreateSkipsContainerDirsInPrecheck(t *testing.T) {
 	r, err := roots.Get(id)
 	require.NoError(t, err)
 	require.Equal(t, "auto", r.WatchMode)
+}
+
+func TestDeleteCascadesFileIndexAndEmitsTombstones(t *testing.T) {
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	rRoots := repo.NewWikiRoots(d)
+	rNodes := repo.NewWikiNodes(d)
+	rFiles := repo.NewFileIndex(d)
+	rEvents := repo.NewFileEvents(d)
+	m := NewManager(rRoots, rNodes, rFiles, rEvents, nil, nil)
+
+	dir := t.TempDir()
+	id, _, err := m.Create(CreateArgs{Path: dir, Level: "space"})
+	require.NoError(t, err)
+
+	for _, f := range []repo.FileIndex{
+		{ID: repo.NewID(), RootID: id, Path: dir + "/x.txt", Parent: dir, Status: "present"},
+		{ID: repo.NewID(), RootID: id, Path: dir + "/y.pdf", Parent: dir, Status: "present"},
+		{ID: repo.NewID(), RootID: id, Path: dir + "/sub", Parent: dir, IsDir: true, Status: "present"},
+	} {
+		require.NoError(t, rFiles.Upsert(f))
+	}
+	require.NoError(t, rEvents.Insert(repo.FileEvent{
+		ID: repo.NewID(), RootID: id, Path: dir + "/x.txt", Op: "create",
+		DetectedAt: time.Now().UnixMilli(),
+	}))
+
+	require.NoError(t, m.Delete(id, false))
+
+	// file_index 级联清空
+	rows, err := rFiles.ListByRootAfter(id, "", 100)
+	require.NoError(t, err)
+	require.Empty(t, rows)
+
+	// 旧 create 事件被清;每个文件(不含目录)有一条预标 processed 的 delete tombstone
+	evs, err := rEvents.ListSince(id, 0, 100)
+	require.NoError(t, err)
+	var tombs []repo.FileEvent
+	for _, e := range evs {
+		require.Equal(t, "delete", e.Op, "non-delete events must be purged")
+		tombs = append(tombs, e)
+	}
+	require.Len(t, tombs, 2) // x.txt + y.pdf, not sub/
+	for _, e := range tombs {
+		require.NotZero(t, e.ProcessedAt, "tombstones must be pre-marked processed")
+	}
 }
 
 func TestCountDirsQuickTimeoutTreatedAsExceeded(t *testing.T) {

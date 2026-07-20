@@ -23,6 +23,32 @@ func TestFileEvents_ArchiveAndPurge(t *testing.T) {
 	require.Equal(t, int64(1), n2, "one event purged")
 }
 
+func TestInsertBatchAndPurgeByRootExceptDeletes(t *testing.T) {
+	d := openTestDB(t)
+	r := NewFileEvents(d)
+
+	now := time.Now().UnixMilli()
+	require.NoError(t, r.InsertBatch([]FileEvent{
+		{RootID: "r1", Path: "/a", Op: "create", DetectedAt: now},
+		{RootID: "r1", Path: "/b", Op: "modify", DetectedAt: now},
+		{RootID: "r1", Path: "/c", Op: "delete", DetectedAt: now},
+		{RootID: "r2", Path: "/d", Op: "create", DetectedAt: now},
+	}))
+	evs, err := r.ListSince("", 0, 100)
+	require.NoError(t, err)
+	require.Len(t, evs, 4)
+	for _, e := range evs {
+		require.NotEmpty(t, e.ID) // InsertBatch fills missing IDs
+	}
+
+	n, err := r.PurgeByRootExceptDeletes("r1")
+	require.NoError(t, err)
+	require.EqualValues(t, 2, n) // create+modify gone, delete kept, r2 untouched
+
+	evs, _ = r.ListSince("", 0, 100)
+	require.Len(t, evs, 2)
+}
+
 func TestFileEvents_RecentForNode_CaseSensitive(t *testing.T) {
 	d := openTestDB(t)
 	r := NewFileEvents(d)

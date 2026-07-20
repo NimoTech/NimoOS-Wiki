@@ -63,7 +63,7 @@ func newHarness(t *testing.T) (*harness, context.CancelFunc) {
 	}
 	bus := eventbus.Noop{}
 	ig := ignore.New([]string{"node_modules", ".git"})
-	h.mgr = roots.NewManager(h.roots, h.nodes, bus, ig)
+	h.mgr = roots.NewManager(h.roots, h.nodes, h.files, h.events, bus, ig)
 	h.rec = scanner.NewReconciler(h.files, h.events, ig)
 	h.watch = scanner.NewWatcher(h.events, h.nodes, ig, nil, nil)
 	locks := nodelock.New()

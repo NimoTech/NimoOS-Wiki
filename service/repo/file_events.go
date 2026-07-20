@@ -86,6 +86,53 @@ func (r *FileEventsRepo) ListSince(rootID string, sinceMs int64, limit int) ([]F
 	return out, rows.Err()
 }
 
+// PurgeByRootExceptDeletes drops a root's create/modify/rename events — moot
+// once the root is being deleted. op='delete' rows are kept: the Parser's
+// global cursor may not have consumed them yet and they are its only signal
+// to drop paths that vanished before the root did.
+func (r *FileEventsRepo) PurgeByRootExceptDeletes(rootID string) (int64, error) {
+	res, err := r.db.Exec(`DELETE FROM file_events WHERE root_id = ? AND op != 'delete'`, rootID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// InsertBatch inserts events in a single transaction (prepared statement) —
+// used by root-deletion cascade which may emit tens of thousands of
+// tombstones; row-at-a-time inserts would fsync per event. Fills empty IDs.
+func (r *FileEventsRepo) InsertBatch(events []FileEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare(`INSERT INTO file_events
+		(id, root_id, path, op, rename_to, is_dir, detected_at, processed_at, archived)
+		VALUES (?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	for i := range events {
+		e := &events[i]
+		if e.ID == "" {
+			e.ID = NewID()
+		}
+		if _, err := stmt.Exec(e.ID, e.RootID, e.Path, e.Op, nullableStr(e.RenameTo),
+			b2i(e.IsDir), e.DetectedAt, nullable(e.ProcessedAt), b2i(e.Archived)); err != nil {
+			_ = stmt.Close()
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	_ = stmt.Close()
+	return tx.Commit()
+}
+
 func (r *FileEventsRepo) RecentForRoot(rootID string, limit int) ([]FileEvent, error) {
 	rows, err := r.db.Query(`SELECT `+evCols+` FROM file_events
 		WHERE root_id = ? ORDER BY detected_at DESC LIMIT ?`, rootID, limit)

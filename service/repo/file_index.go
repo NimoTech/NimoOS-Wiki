@@ -111,6 +111,17 @@ func (r *FileIndexRepo) DeleteByPath(rootID, path string) error {
 	return err
 }
 
+// DeleteByRoot removes every file_index row for rootID. Root-deletion cascade
+// (2026-07-20 follow-up: deleting a root used to leave all its rows behind).
+func (r *FileIndexRepo) DeleteByRoot(rootID string) (int64, error) {
+	res, err := r.db.Exec(`DELETE FROM file_index WHERE root_id = ?`, rootID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 var evidenceTextExts = []string{
 	"md", "txt", "json", "csv", "yaml", "yml", "toml", "ini",
 	"go", "py", "ts", "tsx", "js", "rs", "java", "c", "h", "cpp", "sh", "sql",
