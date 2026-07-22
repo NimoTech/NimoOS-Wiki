@@ -65,18 +65,18 @@ func Render(d Doc) (string, string) {
 
 	var sys bytes.Buffer
 	sys.WriteString("<!-- BEGIN: system -->\n")
-	sys.WriteString("<!-- 这段由系统自动维护,请勿手动编辑。要写笔记请在文件末尾的 User Notes 区域。 -->\n\n")
+	sys.WriteString("<!-- This section is maintained automatically by the system. Do not edit it by hand. To write notes, use the User Notes region at the end of the file. -->\n\n")
 
 	sys.WriteString("## Summary\n")
 	if d.Summary == "" {
-		sys.WriteString("_暂未生成（待 AI 摘要 worker 处理）_\n\n")
+		sys.WriteString("_Not generated yet (pending AI summary worker)_\n\n")
 	} else {
 		sys.WriteString(d.Summary + "\n\n")
 	}
 
 	sys.WriteString("## Child Map\n")
 	if len(d.ChildMap) == 0 {
-		sys.WriteString("_空目录_\n\n")
+		sys.WriteString("_Empty directory_\n\n")
 	} else {
 		for _, c := range d.ChildMap {
 			sys.WriteString("- `" + c.Name + "/` — " + c.Description + "\n")
@@ -86,7 +86,7 @@ func Render(d Doc) (string, string) {
 
 	sys.WriteString("## Key Sources\n")
 	if len(d.KeySources) == 0 {
-		sys.WriteString("_暂未生成_\n\n")
+		sys.WriteString("_Not generated yet_\n\n")
 	} else {
 		for _, s := range d.KeySources {
 			sys.WriteString("- " + s + "\n")
@@ -96,7 +96,7 @@ func Render(d Doc) (string, string) {
 
 	sys.WriteString("## Recent Changes\n")
 	if len(d.RecentChanges) == 0 {
-		sys.WriteString("_无最近变化_\n\n")
+		sys.WriteString("_No recent changes_\n\n")
 	} else {
 		for _, ch := range d.RecentChanges {
 			sys.WriteString(fmt.Sprintf("- %s  %-9s %s\n",
@@ -107,11 +107,11 @@ func Render(d Doc) (string, string) {
 
 	sys.WriteString("## Pending Index\n")
 	if d.PendingCount == 0 {
-		sys.WriteString("_全部已索引_\n\n")
+		sys.WriteString("_All indexed_\n\n")
 	} else {
-		sys.WriteString(fmt.Sprintf("- %d 个文件等待解析（已入队）\n", d.PendingCount))
+		sys.WriteString(fmt.Sprintf("- %d file(s) pending parse (queued)\n", d.PendingCount))
 		for _, p := range d.PendingFailed {
-			sys.WriteString("- 解析失败: `" + p + "`\n")
+			sys.WriteString("- Parse failed: `" + p + "`\n")
 		}
 		sys.WriteString("\n")
 	}
@@ -148,7 +148,7 @@ func Render(d Doc) (string, string) {
 	out.WriteString("\n<!-- BEGIN: user-notes -->\n")
 	out.WriteString("## User Notes\n\n")
 	if strings.TrimSpace(d.UserNotes) == "" {
-		out.WriteString("（在这里写任何你想让 AI 记住的笔记。系统不会修改这部分内容。）\n")
+		out.WriteString("(Write any notes you want the AI to remember here. The system will not modify this section.)\n")
 	} else {
 		out.WriteString(d.UserNotes)
 		if !strings.HasSuffix(d.UserNotes, "\n") {

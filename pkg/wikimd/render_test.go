@@ -43,7 +43,7 @@ func TestRender_EmptySectionsShowPlaceholder(t *testing.T) {
 	d := Doc{Version: 1, Path: "/X", Level: "system", Generator: "nimoos-wiki/0.1.0"}
 	out, _ := Render(d)
 	require.Contains(t, out, "## Summary")
-	require.Contains(t, out, "_暂未生成")
+	require.Contains(t, out, "_Not generated yet")
 	require.Contains(t, out, "## Key Sources")
 	require.True(t, strings.Contains(out, "<!-- BEGIN: user-notes -->"))
 }

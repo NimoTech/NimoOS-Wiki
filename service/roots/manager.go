@@ -351,7 +351,7 @@ func writeTest(path string) error {
 // check cheap). exceeded is true if the count hit limit or the walk timed
 // out before finishing — both cases mean "too big/slow to safely watch".
 //
-// Container dirs (spec §4.4: "跳过容器目录", e.g. /DATA/.system_data) are
+// Container dirs (spec §4.4 "skip container directories", e.g. /DATA/.system_data) are
 // skipped entirely — neither counted nor descended into — so their bulk
 // never false-positives an otherwise-small root into scan_only. ig may be
 // nil (tests, or callers with no matcher wired), in which case every
