@@ -225,17 +225,20 @@ func groupDisplayName(g childmap.Group) string {
 func describeGroup(g childmap.Group) string {
 	if g.IsDir {
 		if g.IsOpaque {
-			return fmt.Sprintf("%d 个文件 (已跳过)", g.ChildFileCount)
+			return fmt.Sprintf("%d files (skipped)", g.ChildFileCount)
 		}
 		if g.ChildFileCount > 0 {
-			return fmt.Sprintf("%d 个文件", g.ChildFileCount)
+			return fmt.Sprintf("%d files", g.ChildFileCount)
 		}
-		return "目录"
+		return "directory"
 	}
 	if g.IsAggregate {
-		return fmt.Sprintf("%d 个 .%s", g.Count, g.Ext)
+		if g.Ext == childmap.OtherBucket {
+			return fmt.Sprintf("%d other files", g.Count)
+		}
+		return fmt.Sprintf("%d .%s files", g.Count, g.Ext)
 	}
-	return "文件"
+	return "file"
 }
 
 // Run flushes dirty nodes on a ticker until ctx is cancelled.

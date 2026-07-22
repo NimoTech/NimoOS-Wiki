@@ -35,7 +35,7 @@ func TestAggregate_TopN(t *testing.T) {
 	}
 	groups := Aggregate(entries, 50)
 	require.Len(t, groups, 9)
-	require.Equal(t, "其它", groups[8].Ext)
+	require.Equal(t, OtherBucket, groups[8].Ext)
 }
 
 func TestAggregate_PreservesDirsAndOpaque(t *testing.T) {

@@ -6,6 +6,10 @@ package childmap
 
 import "sort"
 
+// OtherBucket is the name of the catch-all extension bucket that collects the
+// long tail of aggregated file groups beyond the top 8.
+const OtherBucket = "other"
+
 // Entry is one child of a directory, as observed by the scanner.
 type Entry struct {
 	Name           string
@@ -40,7 +44,7 @@ type Group struct {
 //   - if NO extension bucket exceeds `threshold`, every file is emitted as
 //     its own Group (no aggregation kicks in);
 //   - otherwise, all file buckets are aggregated; the top 8 are kept by Count
-//     and the rest collapsed into a single "其它" bucket.
+//     and the rest collapsed into a single "other" bucket.
 func Aggregate(entries []Entry, threshold int) []Group {
 	var out []Group
 	byExt := map[string][]Entry{}
@@ -94,7 +98,7 @@ func Aggregate(entries []Entry, threshold int) []Group {
 	if len(aggs) > 8 {
 		extras := aggs[8:]
 		aggs = aggs[:8]
-		other := Group{IsAggregate: true, Ext: "其它", Name: "其它"}
+		other := Group{IsAggregate: true, Ext: OtherBucket, Name: OtherBucket}
 		for _, g := range extras {
 			other.Count += g.Count
 		}

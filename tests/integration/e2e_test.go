@@ -188,14 +188,14 @@ func TestE2E_ExternalUserNotesEdit_SyncedToDB(t *testing.T) {
 	// Simulate external SMB edit: rewrite the user-notes block
 	body := readWikiMD(t, root)
 	newBody := strings.Replace(body,
-		"（在这里写任何你想让 AI 记住的笔记。系统不会修改这部分内容。）",
-		"用户写的笔记", 1)
+		"(Write any notes you want the AI to remember here. The system will not modify this section.)",
+		"notes written by the user", 1)
 	require.NoError(t, os.WriteFile(filepath.Join(root, ".wiki.md"), []byte(newBody), 0644))
 
 	// Verify DB picked it up
 	require.Eventually(t, func() bool {
 		n, _ := h.nodes.Get(root)
-		return n != nil && strings.Contains(n.UserNotes, "用户写的笔记")
+		return n != nil && strings.Contains(n.UserNotes, "notes written by the user")
 	}, 6*time.Second, 100*time.Millisecond, "DB should have absorbed external user-notes edit")
 }
 
