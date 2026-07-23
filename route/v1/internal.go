@@ -248,28 +248,3 @@ func clampInt(s string, def, lo, hi int) int {
 	}
 	return v
 }
-
-// getInternalUserRoots returns the root_ids visible to the given user.
-//
-// MVP behavior: returns ALL enabled roots (Wiki currently has no user_id
-// dimension; this endpoint is a forward-compatible scope interface that
-// NimoOS-Search depends on, per spec 2026-05-22-nimoos-search-design.md §5.2).
-// Future: filter rows where root.user_id matches.
-func getInternalUserRoots(d Deps) echo.HandlerFunc {
-	return func(c echo.Context) error {
-		userID := c.QueryParam("user_id")
-		_ = userID // logged below; not yet used for filtering
-		c.Logger().Infof("user-roots requested for user_id=%q (MVP: ignoring)", userID)
-		roots, err := d.WikiRoots.List()
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-		}
-		ids := make([]string, 0, len(roots))
-		for _, r := range roots {
-			if r.Enabled {
-				ids = append(ids, r.ID)
-			}
-		}
-		return c.JSON(http.StatusOK, map[string]any{"root_ids": ids})
-	}
-}
