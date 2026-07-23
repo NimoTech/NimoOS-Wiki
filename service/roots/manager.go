@@ -3,6 +3,7 @@
 package roots
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -14,8 +15,21 @@ import (
 	"github.com/NimoTech/NimoOS-Wiki/pkg/ignore"
 	"github.com/NimoTech/NimoOS-Wiki/service/eventbus"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
+	"github.com/NimoTech/NimoOS-Wiki/service/rootsync"
 	"github.com/NimoTech/NimoOS-Wiki/service/scanner"
+	"go.uber.org/zap"
 )
+
+// pushTimeout 是 manager 向核心增量推送(Upsert/Delete)单次调用的超时:核心是
+// 内网服务,3s 足够;超时也按失败处理,交由调用方置 needs_reconcile。
+const pushTimeout = 3 * time.Second
+
+// pusher 是 manager 对核心授权推送的最小依赖(便于测试注入 fake pusher,
+// 也避免 manager 直接依赖 rootsync.Client 的完整实现细节)。
+type pusher interface {
+	Upsert(ctx context.Context, g rootsync.Grant) error
+	Delete(ctx context.Context, rootID string) error
+}
 
 type Manager struct {
 	roots  *repo.WikiRootsRepo
@@ -25,6 +39,12 @@ type Manager struct {
 	bus    eventbus.Bus
 	watch  Watch
 	ig     *ignore.Matcher
+
+	// pusher 推送 root 生命周期变化给核心授权源(授权源解耦项目);nil(测试、
+	// 未接线场景)意味着跳过推送,启动时的全量 Reconcile 仍会兜底。
+	pusher pusher
+	// log 用于推送失败时的 Warn;默认 no-op,main 通过 SetLogger 注入真实 logger。
+	log *zap.Logger
 
 	// PrecheckDirLimit / PrecheckTimeout bound the size precheck run in
 	// Create (spec §4.4). Zero-value PrecheckDirLimit skips the precheck
@@ -41,7 +61,51 @@ func NewManager(roots *repo.WikiRootsRepo, nodes *repo.WikiNodesRepo,
 	if bus == nil {
 		bus = eventbus.Noop{}
 	}
-	return &Manager{roots: roots, nodes: nodes, files: files, events: events, bus: bus, ig: ig}
+	return &Manager{roots: roots, nodes: nodes, files: files, events: events, bus: bus, ig: ig, log: zap.NewNop()}
+}
+
+// SetPusher wires the core-authority push client (called once from main,
+// after rootsync.New()). Nil (tests, CLI) means push is skipped.
+func (m *Manager) SetPusher(p pusher) { m.pusher = p }
+
+// SetLogger wires the process-wide zap logger (called once from main).
+// A nil argument is ignored, keeping the no-op default from NewManager.
+func (m *Manager) SetLogger(l *zap.Logger) {
+	if l != nil {
+		m.log = l
+	}
+}
+
+// pushUpsert 尽力而为地把 root 的当前状态(id/path/enabled)推给核心。推送
+// 失败(网络错误、核心未就绪、超时等)仅记录 Warn 并把该 root 标记为
+// needs_reconcile——不返回 error、不阻塞调用方,与既有 MessageBus 软依赖同一
+// 哲学;真正的一致性兜底是 main.go 启动时对全部 root 的一次全量 Reconcile。
+func (m *Manager) pushUpsert(id, path string, enabled bool) {
+	if m.pusher == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), pushTimeout)
+	defer cancel()
+	g := rootsync.Grant{RootID: id, Path: path, Enabled: enabled}
+	if err := m.pusher.Upsert(ctx, g); err != nil {
+		m.log.Warn("push root grant upsert failed; marked needs_reconcile",
+			zap.String("root_id", id), zap.Error(err))
+		_ = m.roots.SetNeedsReconcile(id, true)
+	}
+}
+
+// pushDelete 尽力而为地把 root 删除同步给核心;失败处理同 pushUpsert。
+func (m *Manager) pushDelete(id string) {
+	if m.pusher == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), pushTimeout)
+	defer cancel()
+	if err := m.pusher.Delete(ctx, id); err != nil {
+		m.log.Warn("push root grant delete failed; marked needs_reconcile",
+			zap.String("root_id", id), zap.Error(err))
+		_ = m.roots.SetNeedsReconcile(id, true)
+	}
 }
 
 // Watch is the subset of scanner.Watcher the Manager drives when roots are
@@ -204,6 +268,8 @@ func (m *Manager) Create(args CreateArgs) (string, string, error) {
 		"level":   args.Level,
 	})
 
+	m.pushUpsert(id, args.Path, true)
+
 	return id, modeReason, nil
 }
 
@@ -289,6 +355,9 @@ func (m *Manager) Delete(id string, purgeFiles bool) error {
 		"path":    root.Path,
 		"level":   root.Level,
 	})
+
+	m.pushDelete(id)
+
 	return nil
 }
 
@@ -335,6 +404,9 @@ func (m *Manager) SetEnabled(id string, enabled bool) error {
 		}
 		m.bus.Publish(common.EventRootDisabled, payload)
 	}
+
+	m.pushUpsert(id, root.Path, enabled)
+
 	return nil
 }
 

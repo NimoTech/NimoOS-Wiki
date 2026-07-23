@@ -28,6 +28,7 @@ import (
 	"github.com/NimoTech/NimoOS-Wiki/service/processor"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
 	"github.com/NimoTech/NimoOS-Wiki/service/roots"
+	"github.com/NimoTech/NimoOS-Wiki/service/rootsync"
 	"github.com/NimoTech/NimoOS-Wiki/service/scanner"
 	"github.com/NimoTech/NimoOS-Wiki/service/writer"
 	"github.com/coreos/go-systemd/daemon"
@@ -100,6 +101,11 @@ func main() {
 	mgr := roots.NewManager(rRoots, rNodes, rFiles, rEvents, bus, ig)
 	mgr.PrecheckDirLimit = config.Cfg.PrecheckDirLimit
 	mgr.PrecheckTimeout = time.Duration(config.Cfg.PrecheckTimeoutMs) * time.Millisecond
+	// 授权源解耦:核心是唯一的授权权威,root 生命周期变化(增/删/启停)需增量
+	// 推给核心;discoveryFile 是核心启动时写入的服务发现文件,记录当前监听地址。
+	rsClient := rootsync.New("/var/run/nimoos/nimoos.url")
+	mgr.SetPusher(rsClient)
+	mgr.SetLogger(zapLog)
 	rec := scanner.NewReconciler(rFiles, rEvents, ig)
 	rec.BatchSize = config.Cfg.ReconcileBatchSize
 	rec.ThrottleEvery = config.Cfg.WalkThrottleEvery
@@ -122,6 +128,13 @@ func main() {
 	// path doesn't race with the disk-vs-DB comparison.
 	if err := bootSyncWikiMD(rRoots, proc); err != nil {
 		zapLog.Warn("boot user-notes sync failed (non-fatal)", zap.Error(err))
+	}
+
+	// 授权源解耦 Task 5:启动时把当前全部 root 状态整体推给核心做一次全量对账,
+	// 弥补运行期间任何一次增量推送(Create/SetEnabled/Delete)失败的窗口。核心
+	// 不可达也只 Warn、不阻塞 readiness——单次调用内部已带 3s 超时兜底。
+	if err := bootReconcileRootSync(ctx, rRoots, rsClient); err != nil {
+		zapLog.Warn("boot root-grant reconcile failed (non-fatal)", zap.Error(err))
 	}
 
 	// Register watchers for each enabled root
@@ -278,6 +291,22 @@ func bootSyncWikiMD(r *repo.WikiRootsRepo, proc *processor.EventProcessor) error
 		}
 	}
 	return nil
+}
+
+// bootReconcileRootSync 读取全部 root(含 disabled)组装为 rootsync.Grant 列表,
+// 推给核心做一次全量对账(POST .../reconcile,核心以此为准同步 source="wiki"
+// 的全部行)。是运行期间任何一次增量推送(pushUpsert/pushDelete)失败后的
+// 最终一致性兜底,因此覆盖全部 root 而非仅 needs_reconcile 的子集。
+func bootReconcileRootSync(ctx context.Context, r *repo.WikiRootsRepo, rs *rootsync.Client) error {
+	all, err := r.List()
+	if err != nil {
+		return err
+	}
+	grants := make([]rootsync.Grant, 0, len(all))
+	for _, root := range all {
+		grants = append(grants, rootsync.Grant{RootID: root.ID, Path: root.Path, Enabled: root.Enabled})
+	}
+	return rs.Reconcile(ctx, grants)
 }
 
 func listEnabled(r *repo.WikiRootsRepo) []repo.WikiRoot {
