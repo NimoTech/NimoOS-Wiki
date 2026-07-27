@@ -166,6 +166,9 @@ func main() {
 		runReconcilerLoop(ctx, rRoots, rec, guard, rEvents)
 	}()
 	go runArchiveJob(ctx, rEvents, rRoots, config.Cfg.RecentChangesRetentionDays, config.Cfg.EventMaxRows)
+	// 授权源解耦 Task 5 Critical 修复(方案 B):与上面的 FS 重扫 reconcileTick
+	// 完全独立的专用重试循环,只消费 needs_authz_push / manager 内存脏标。
+	go runAuthzPushRetryLoop(ctx, rRoots, rsClient, mgr)
 
 	// Listener — random localhost port
 	listener, err := net.Listen("tcp", net.JoinHostPort(common.Localhost, "0"))
@@ -307,6 +310,77 @@ func bootReconcileRootSync(ctx context.Context, r *repo.WikiRootsRepo, rs *roots
 		grants = append(grants, rootsync.Grant{RootID: root.ID, Path: root.Path, Enabled: root.Enabled})
 	}
 	return rs.Reconcile(ctx, grants)
+}
+
+// authzPushRetryInterval 是专用授权推送重试循环的 tick 间隔。60s 足够快地
+// 收敛核心侧的授权漂移窗口,又不会在无待推信号时给 DB 增加明显负担(每 tick
+// 只有一条 COUNT/EXISTS 查询)。
+const authzPushRetryInterval = 60 * time.Second
+
+// authzReconciler 是重试循环对 rootsync 的最小依赖(同 roots.pusher 的解耦
+// 理由):测试用 fake 记录调用次数/参数,无需起 httptest 服务器。
+// *rootsync.Client 天然满足此接口。
+type authzReconciler interface {
+	Reconcile(ctx context.Context, grants []rootsync.Grant) error
+}
+
+// authzDirtyChecker 是 roots.Manager 暴露给重试循环的最小读写面:pushDelete
+// 失败时置位的内存脏标(该 root 行已被删,DB 里无处落盘)。
+type authzDirtyChecker interface {
+	AuthzDirty() bool
+	ClearAuthzDirty()
+}
+
+// runAuthzPushRetryLoop 是与 runReconcilerLoop(FS 重扫)完全独立的 goroutine:
+// 每 authzPushRetryInterval 检查一次是否存在待重推的 root 授权信号(DB 里
+// needs_authz_push 置位的行,或 manager 内存脏标——分别对应 pushUpsert /
+// pushDelete 失败),存在则触发一次全量幂等 Reconcile 同时纠正两类漂移。
+func runAuthzPushRetryLoop(ctx context.Context, r *repo.WikiRootsRepo, rs authzReconciler, mgr authzDirtyChecker) {
+	t := time.NewTicker(authzPushRetryInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			authzPushRetryTick(ctx, r, rs, mgr, zapLog)
+		}
+	}
+}
+
+// authzPushRetryTick 是重试循环的一次 tick:无待推信号(DB 无 needs_authz_push
+// 行 且 内存脏标为假)时只有一条 COUNT 查询,零成本空转;否则取全部现存 root
+// 组装 Grant 列表,调用一次全量 Reconcile——成功则清空 DB 全部标记 + 内存脏标,
+// 失败则保留标记等下个 tick 再试(仅 Warn,不阻塞、不 panic)。
+func authzPushRetryTick(ctx context.Context, r *repo.WikiRootsRepo, rs authzReconciler,
+	mgr authzDirtyChecker, log *zap.Logger) {
+	pending, err := r.HasNeedsAuthzPush()
+	if err != nil {
+		log.Warn("authz push retry: query pending failed", zap.Error(err))
+		return
+	}
+	if !pending && !mgr.AuthzDirty() {
+		return
+	}
+
+	all, err := r.List()
+	if err != nil {
+		log.Warn("authz push retry: list roots failed", zap.Error(err))
+		return
+	}
+	grants := make([]rootsync.Grant, 0, len(all))
+	for _, root := range all {
+		grants = append(grants, rootsync.Grant{RootID: root.ID, Path: root.Path, Enabled: root.Enabled})
+	}
+
+	if err := rs.Reconcile(ctx, grants); err != nil {
+		log.Warn("authz push retry: reconcile failed; will retry next tick", zap.Error(err))
+		return
+	}
+	if err := r.ClearAllNeedsAuthzPush(); err != nil {
+		log.Warn("authz push retry: clear needs_authz_push failed", zap.Error(err))
+	}
+	mgr.ClearAuthzDirty()
 }
 
 func listEnabled(r *repo.WikiRootsRepo) []repo.WikiRoot {

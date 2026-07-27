@@ -11,6 +11,10 @@ type WikiRoot struct {
 	CreatedAt      int64
 	LastScanAt     int64
 	NeedsReconcile bool
+	// NeedsAuthzPush 标记本行的核心授权推送(Upsert)曾经失败、待独立重试循环
+	// 用全量 Reconcile 纠正(授权源解耦 Task 5 Critical 修复:与 NeedsReconcile
+	// 语义无关——后者是 FS 重扫信号,详见 service/roots/manager.go pushUpsert)。
+	NeedsAuthzPush bool
 }
 
 type WikiNode struct {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/NimoTech/NimoOS-Wiki/common"
@@ -46,6 +47,14 @@ type Manager struct {
 	// log 用于推送失败时的 Warn;默认 no-op,main 通过 SetLogger 注入真实 logger。
 	log *zap.Logger
 
+	// authzDirty 是 pushDelete 失败时的内存脏标(Critical 修复,方案 B):delete
+	// 失败时该 root 行已经被删,DB 里无处落盘持久标记,只能靠这个内存标志告诉
+	// main.go 的专用重试循环"存在待纠正的授权残留",下一轮 tick 用全量幂等
+	// Reconcile 兜底;重启则天然由 bootReconcileRootSync 的启动全量对账覆盖,
+	// 无需持久化。原子操作:pushDelete 在业务 goroutine 里写,重试循环在自己的
+	// goroutine 里读/清,避免数据竞争。
+	authzDirty atomic.Bool
+
 	// PrecheckDirLimit / PrecheckTimeout bound the size precheck run in
 	// Create (spec §4.4). Zero-value PrecheckDirLimit skips the precheck
 	// entirely (keeps pre-Task-7 tests green); main injects both from config.
@@ -78,8 +87,10 @@ func (m *Manager) SetLogger(l *zap.Logger) {
 
 // pushUpsert 尽力而为地把 root 的当前状态(id/path/enabled)推给核心。推送
 // 失败(网络错误、核心未就绪、超时等)仅记录 Warn 并把该 root 标记为
-// needs_reconcile——不返回 error、不阻塞调用方,与既有 MessageBus 软依赖同一
-// 哲学;真正的一致性兜底是 main.go 启动时对全部 root 的一次全量 Reconcile。
+// needs_authz_push(Critical 修复,方案 B:独立字段,不再误用 FS 重扫语义的
+// needs_reconcile)——不返回 error、不阻塞调用方,与既有 MessageBus 软依赖同一
+// 哲学;真正的重试由 main.go 的专用授权推送重试循环消费该标记,统一走全量
+// 幂等 Reconcile 纠正。
 func (m *Manager) pushUpsert(id, path string, enabled bool) {
 	if m.pusher == nil {
 		return
@@ -88,13 +99,15 @@ func (m *Manager) pushUpsert(id, path string, enabled bool) {
 	defer cancel()
 	g := rootsync.Grant{RootID: id, Path: path, Enabled: enabled}
 	if err := m.pusher.Upsert(ctx, g); err != nil {
-		m.log.Warn("push root grant upsert failed; marked needs_reconcile",
+		m.log.Warn("push root grant upsert failed; marked needs_authz_push",
 			zap.String("root_id", id), zap.Error(err))
-		_ = m.roots.SetNeedsReconcile(id, true)
+		_ = m.roots.SetNeedsAuthzPush(id, true)
 	}
 }
 
-// pushDelete 尽力而为地把 root 删除同步给核心;失败处理同 pushUpsert。
+// pushDelete 尽力而为地把 root 删除同步给核心;失败时该 root 行已被
+// m.roots.Delete 删除,DB 里没有行可落 needs_authz_push 标记,于是改置内存脏标
+// authzDirty,交给重试循环靠全量 Reconcile 兜底(见 authzDirty 字段注释)。
 func (m *Manager) pushDelete(id string) {
 	if m.pusher == nil {
 		return
@@ -102,11 +115,19 @@ func (m *Manager) pushDelete(id string) {
 	ctx, cancel := context.WithTimeout(context.Background(), pushTimeout)
 	defer cancel()
 	if err := m.pusher.Delete(ctx, id); err != nil {
-		m.log.Warn("push root grant delete failed; marked needs_reconcile",
+		m.log.Warn("push root grant delete failed; marked authz dirty",
 			zap.String("root_id", id), zap.Error(err))
-		_ = m.roots.SetNeedsReconcile(id, true)
+		m.authzDirty.Store(true)
 	}
 }
+
+// AuthzDirty 报告是否存在因 pushDelete 失败而产生的、无法持久化的授权残留
+// 待纠正信号,供 main.go 的专用重试循环判断本轮 tick 是否需要触发一次全量
+// Reconcile。
+func (m *Manager) AuthzDirty() bool { return m.authzDirty.Load() }
+
+// ClearAuthzDirty 清除内存脏标,在重试循环里的全量 Reconcile 成功后调用。
+func (m *Manager) ClearAuthzDirty() { m.authzDirty.Store(false) }
 
 // Watch is the subset of scanner.Watcher the Manager drives when roots are
 // created, deleted, enabled or disabled at runtime. Nil (tests, CLI) means

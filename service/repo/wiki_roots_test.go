@@ -63,6 +63,76 @@ func TestSetNeedsReconcileRoundtrip(t *testing.T) {
 	require.False(t, g.NeedsReconcile)
 }
 
+func TestSetNeedsAuthzPushRoundtrip(t *testing.T) {
+	d := openTestDB(t)
+	r := NewWikiRoots(d)
+	now := time.Now().UnixMilli()
+	require.NoError(t, r.Insert(WikiRoot{
+		ID: "id4", Path: "/DATA4", Level: "space", WatchMode: "auto",
+		StorageMode: "inline", Enabled: true, ScanIntervalS: 600, CreatedAt: now,
+	}))
+	g, err := r.Get("id4")
+	require.NoError(t, err)
+	require.False(t, g.NeedsAuthzPush)
+
+	require.NoError(t, r.SetNeedsAuthzPush("id4", true))
+	g, err = r.Get("id4")
+	require.NoError(t, err)
+	require.True(t, g.NeedsAuthzPush)
+
+	require.NoError(t, r.SetNeedsAuthzPush("id4", false))
+	g, err = r.Get("id4")
+	require.NoError(t, err)
+	require.False(t, g.NeedsAuthzPush)
+}
+
+func TestHasNeedsAuthzPush(t *testing.T) {
+	d := openTestDB(t)
+	r := NewWikiRoots(d)
+	now := time.Now().UnixMilli()
+	require.NoError(t, r.Insert(WikiRoot{
+		ID: "id5", Path: "/DATA5", Level: "space", WatchMode: "auto",
+		StorageMode: "inline", Enabled: true, ScanIntervalS: 600, CreatedAt: now,
+	}))
+
+	pending, err := r.HasNeedsAuthzPush()
+	require.NoError(t, err)
+	require.False(t, pending)
+
+	require.NoError(t, r.SetNeedsAuthzPush("id5", true))
+	pending, err = r.HasNeedsAuthzPush()
+	require.NoError(t, err)
+	require.True(t, pending)
+}
+
+func TestClearAllNeedsAuthzPush(t *testing.T) {
+	d := openTestDB(t)
+	r := NewWikiRoots(d)
+	now := time.Now().UnixMilli()
+	require.NoError(t, r.Insert(WikiRoot{
+		ID: "id6", Path: "/DATA6", Level: "space", WatchMode: "auto",
+		StorageMode: "inline", Enabled: true, ScanIntervalS: 600, CreatedAt: now,
+	}))
+	require.NoError(t, r.Insert(WikiRoot{
+		ID: "id7", Path: "/DATA7", Level: "space", WatchMode: "auto",
+		StorageMode: "inline", Enabled: true, ScanIntervalS: 600, CreatedAt: now,
+	}))
+	require.NoError(t, r.SetNeedsAuthzPush("id6", true))
+	require.NoError(t, r.SetNeedsAuthzPush("id7", true))
+
+	require.NoError(t, r.ClearAllNeedsAuthzPush())
+
+	pending, err := r.HasNeedsAuthzPush()
+	require.NoError(t, err)
+	require.False(t, pending)
+	g6, err := r.Get("id6")
+	require.NoError(t, err)
+	require.False(t, g6.NeedsAuthzPush)
+	g7, err := r.Get("id7")
+	require.NoError(t, err)
+	require.False(t, g7.NeedsAuthzPush)
+}
+
 func TestSetWatchMode(t *testing.T) {
 	d := openTestDB(t)
 	r := NewWikiRoots(d)

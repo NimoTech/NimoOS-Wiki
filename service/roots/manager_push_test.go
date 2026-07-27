@@ -94,7 +94,10 @@ type pusherErr struct{ err error }
 func (p pusherErr) Upsert(context.Context, rootsync.Grant) error { return p.err }
 func (p pusherErr) Delete(context.Context, string) error         { return p.err }
 
-func TestCreate_PushFailureMarksNeedsReconcileButDoesNotFail(t *testing.T) {
+// TestCreate_PushFailureMarksNeedsAuthzPushButDoesNotFail 覆盖方案 B 的修复:
+// upsert 推送失败应置 needs_authz_push(独立重试字段),而不是误用 FS 重扫语义的
+// needs_reconcile(旧 bug,已修复)。
+func TestCreate_PushFailureMarksNeedsAuthzPushButDoesNotFail(t *testing.T) {
 	m, rootsRepo := setupManager(t)
 	m.SetPusher(pusherErr{err: context.DeadlineExceeded})
 	dir := t.TempDir()
@@ -104,5 +107,41 @@ func TestCreate_PushFailureMarksNeedsReconcileButDoesNotFail(t *testing.T) {
 
 	r, err := rootsRepo.Get(id)
 	require.NoError(t, err)
-	require.True(t, r.NeedsReconcile)
+	require.True(t, r.NeedsAuthzPush)
+	require.False(t, r.NeedsReconcile, "upsert 推送失败不应再误置 FS 重扫标记")
+}
+
+// TestSetEnabled_PushFailureMarksNeedsAuthzPush 覆盖 SetEnabled 走的也是
+// pushUpsert 失败路径,同样只置 needs_authz_push。
+func TestSetEnabled_PushFailureMarksNeedsAuthzPush(t *testing.T) {
+	m, rootsRepo := setupManager(t)
+	dir := t.TempDir()
+	id, _, err := m.Create(CreateArgs{Path: dir, Level: "space"})
+	require.NoError(t, err)
+
+	m.SetPusher(pusherErr{err: context.DeadlineExceeded})
+	require.NoError(t, m.SetEnabled(id, false))
+
+	r, err := rootsRepo.Get(id)
+	require.NoError(t, err)
+	require.True(t, r.NeedsAuthzPush)
+}
+
+// TestDelete_PushFailureMarksAuthzDirtyButDoesNotFail 覆盖 delete 推送失败的
+// 独立路径:该 root 行此时已被删除,DB 里无处落盘,只能置 manager 内存脏标
+// (authzDirty),交给重试循环靠全量 Reconcile 兜底。
+func TestDelete_PushFailureMarksAuthzDirtyButDoesNotFail(t *testing.T) {
+	m, _ := setupManager(t)
+	dir := t.TempDir()
+	id, _, err := m.Create(CreateArgs{Path: dir, Level: "space"})
+	require.NoError(t, err)
+
+	require.False(t, m.AuthzDirty(), "初始不应有脏标")
+	m.SetPusher(pusherErr{err: context.DeadlineExceeded})
+
+	require.NoError(t, m.Delete(id, false)) // 推送失败不影响 Delete 本身成功
+	require.True(t, m.AuthzDirty(), "delete 推送失败应置内存脏标")
+
+	m.ClearAuthzDirty()
+	require.False(t, m.AuthzDirty())
 }
