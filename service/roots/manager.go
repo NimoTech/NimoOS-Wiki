@@ -129,6 +129,18 @@ func (m *Manager) AuthzDirty() bool { return m.authzDirty.Load() }
 // ClearAuthzDirty 清除内存脏标,在重试循环里的全量 Reconcile 成功后调用。
 func (m *Manager) ClearAuthzDirty() { m.authzDirty.Store(false) }
 
+// ConsumeAuthzDirty 原子地读取并清空内存脏标(Swap 到 false),供重试循环的
+// consume-then-act 加固使用:tick 一开始就把信号"消费掉",而不是等 Reconcile
+// 跑完才 blanket clear——这样窗口期(消费之后)新产生的信号不会被本轮 tick
+// 误吞。若消费之后本轮实际未能完成对账(List/Reconcile 失败),调用方需用
+// MarkAuthzDirty 把信号找补回去,交给下个 tick 重试。
+func (m *Manager) ConsumeAuthzDirty() bool { return m.authzDirty.Swap(false) }
+
+// MarkAuthzDirty 重新置位内存脏标。用于重试循环在 ConsumeAuthzDirty 消费了
+// 信号之后,却因 List/Reconcile 失败未能真正完成对账时,把信号找补回去,
+// 避免因 consume-then-act 的重排而丢失待纠正的授权漂移。
+func (m *Manager) MarkAuthzDirty() { m.authzDirty.Store(true) }
+
 // Watch is the subset of scanner.Watcher the Manager drives when roots are
 // created, deleted, enabled or disabled at runtime. Nil (tests, CLI) means
 // DB-only: the reconciler still covers the root on its next tick.
