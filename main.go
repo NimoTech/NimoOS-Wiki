@@ -28,6 +28,7 @@ import (
 	"github.com/NimoTech/NimoOS-Wiki/service/processor"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
 	"github.com/NimoTech/NimoOS-Wiki/service/roots"
+	"github.com/NimoTech/NimoOS-Wiki/service/rootsync"
 	"github.com/NimoTech/NimoOS-Wiki/service/scanner"
 	"github.com/NimoTech/NimoOS-Wiki/service/writer"
 	"github.com/coreos/go-systemd/daemon"
@@ -100,6 +101,11 @@ func main() {
 	mgr := roots.NewManager(rRoots, rNodes, rFiles, rEvents, bus, ig)
 	mgr.PrecheckDirLimit = config.Cfg.PrecheckDirLimit
 	mgr.PrecheckTimeout = time.Duration(config.Cfg.PrecheckTimeoutMs) * time.Millisecond
+	// 授权源解耦:核心是唯一的授权权威,root 生命周期变化(增/删/启停)需增量
+	// 推给核心;discoveryFile 是核心启动时写入的服务发现文件,记录当前监听地址。
+	rsClient := rootsync.New("/var/run/nimoos/nimoos.url")
+	mgr.SetPusher(rsClient)
+	mgr.SetLogger(zapLog)
 	rec := scanner.NewReconciler(rFiles, rEvents, ig)
 	rec.BatchSize = config.Cfg.ReconcileBatchSize
 	rec.ThrottleEvery = config.Cfg.WalkThrottleEvery
@@ -122,6 +128,13 @@ func main() {
 	// path doesn't race with the disk-vs-DB comparison.
 	if err := bootSyncWikiMD(rRoots, proc); err != nil {
 		zapLog.Warn("boot user-notes sync failed (non-fatal)", zap.Error(err))
+	}
+
+	// 授权源解耦 Task 5:启动时把当前全部 root 状态整体推给核心做一次全量对账,
+	// 弥补运行期间任何一次增量推送(Create/SetEnabled/Delete)失败的窗口。核心
+	// 不可达也只 Warn、不阻塞 readiness——单次调用内部已带 3s 超时兜底。
+	if err := bootReconcileRootSync(ctx, rRoots, rsClient); err != nil {
+		zapLog.Warn("boot root-grant reconcile failed (non-fatal)", zap.Error(err))
 	}
 
 	// Register watchers for each enabled root
@@ -153,6 +166,9 @@ func main() {
 		runReconcilerLoop(ctx, rRoots, rec, guard, rEvents)
 	}()
 	go runArchiveJob(ctx, rEvents, rRoots, config.Cfg.RecentChangesRetentionDays, config.Cfg.EventMaxRows)
+	// 授权源解耦 Task 5 Critical 修复(方案 B):与上面的 FS 重扫 reconcileTick
+	// 完全独立的专用重试循环,只消费 needs_authz_push / manager 内存脏标。
+	go runAuthzPushRetryLoop(ctx, rRoots, rsClient, mgr)
 
 	// Listener — random localhost port
 	listener, err := net.Listen("tcp", net.JoinHostPort(common.Localhost, "0"))
@@ -278,6 +294,125 @@ func bootSyncWikiMD(r *repo.WikiRootsRepo, proc *processor.EventProcessor) error
 		}
 	}
 	return nil
+}
+
+// bootReconcileRootSync 读取全部 root(含 disabled)组装为 rootsync.Grant 列表,
+// 推给核心做一次全量对账(POST .../reconcile,核心以此为准同步 source="wiki"
+// 的全部行)。是运行期间任何一次增量推送(pushUpsert/pushDelete)失败后的
+// 最终一致性兜底,因此覆盖全部 root 而非仅 needs_reconcile 的子集。
+func bootReconcileRootSync(ctx context.Context, r *repo.WikiRootsRepo, rs *rootsync.Client) error {
+	all, err := r.List()
+	if err != nil {
+		return err
+	}
+	grants := make([]rootsync.Grant, 0, len(all))
+	for _, root := range all {
+		grants = append(grants, rootsync.Grant{RootID: root.ID, Path: root.Path, Enabled: root.Enabled})
+	}
+	return rs.Reconcile(ctx, grants)
+}
+
+// authzPushRetryInterval 是专用授权推送重试循环的 tick 间隔。60s 足够快地
+// 收敛核心侧的授权漂移窗口,又不会在无待推信号时给 DB 增加明显负担(每 tick
+// 只有一条 COUNT/EXISTS 查询)。
+const authzPushRetryInterval = 60 * time.Second
+
+// authzReconciler 是重试循环对 rootsync 的最小依赖(同 roots.pusher 的解耦
+// 理由):测试用 fake 记录调用次数/参数,无需起 httptest 服务器。
+// *rootsync.Client 天然满足此接口。
+type authzReconciler interface {
+	Reconcile(ctx context.Context, grants []rootsync.Grant) error
+}
+
+// authzDirtyChecker 是 roots.Manager 暴露给重试循环的最小读写面(TOCTOU 加固,
+// consume-then-act 语义):ConsumeAuthzDirty 原子读取并清空内存脏标(pushDelete
+// 失败时置位,该 root 行已被删、DB 里无处落盘),MarkAuthzDirty 用于本轮 tick
+// 消费了信号却未能真正对账成功(List/Reconcile 失败)时把信号找补回去。
+type authzDirtyChecker interface {
+	ConsumeAuthzDirty() bool
+	MarkAuthzDirty()
+}
+
+// runAuthzPushRetryLoop 是与 runReconcilerLoop(FS 重扫)完全独立的 goroutine:
+// 每 authzPushRetryInterval 检查一次是否存在待重推的 root 授权信号(DB 里
+// needs_authz_push 置位的行,或 manager 内存脏标——分别对应 pushUpsert /
+// pushDelete 失败),存在则触发一次全量幂等 Reconcile 同时纠正两类漂移。
+func runAuthzPushRetryLoop(ctx context.Context, r *repo.WikiRootsRepo, rs authzReconciler, mgr authzDirtyChecker) {
+	t := time.NewTicker(authzPushRetryInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			authzPushRetryTick(ctx, r, rs, mgr, zapLog)
+		}
+	}
+}
+
+// authzPushRetryTick 是重试循环的一次 tick,按 consume-then-act 顺序执行
+// (TOCTOU 加固,修复"快照 t2 之后、清位 t4 之前"窗口期内新信号被 blanket
+// clear 误吞的竞态):
+//
+//  1. 先消费信号:原子 Swap 内存脏标 + 批量清除 DB 的 needs_authz_push
+//     标记。二者皆无则零成本空转(仅一条 COUNT 查询)。
+//  2. 再取快照:roots.List() 组装全量 Grant。
+//  3. 后对账:调用一次全量幂等 Reconcile。
+//  4. 失败重挂:List/Reconcile 失败 → 重新置位内存脏标,交给下个 tick 重试
+//     (仅 Warn,不阻塞、不 panic);成功则什么都不用清——信号已在第 1 步消费。
+//
+// 这样为什么是对的:所有置信号的写路径——pushUpsert 的 SetNeedsAuthzPush、
+// pushDelete 的 authzDirty.Store(true)——对应的 DB 状态变更(Create/
+// SetEnabled 的行写入、Delete 的行删除)都发生在"推送失败→置信号"之前;
+// 因此第 1 步消费到的任何信号,其 DB 状态必然已经提交,必然会被第 2 步的
+// roots.List() 快照覆盖到,不会漏纠正。而窗口期(第 1 步之后)才新产生的
+// 信号不会被本轮消费,自然原样保留到下个 tick,由下个 tick 用届时更新过的
+// 快照重新对账。崩溃场景(消费了信号但 Reconcile 还没成功就挂了)由启动时
+// bootReconcileRootSync 的全量对账兜底。
+func authzPushRetryTick(ctx context.Context, r *repo.WikiRootsRepo, rs authzReconciler,
+	mgr authzDirtyChecker, log *zap.Logger) {
+	// 第 1 步:消费信号(顺序不影响正确性,内存脏标与 DB 标记是两个独立信号源)。
+	dirty := mgr.ConsumeAuthzDirty()
+	hadFlags, err := r.HasNeedsAuthzPush()
+	if err != nil {
+		log.Warn("authz push retry: query pending failed", zap.Error(err))
+		// 查询失败:DB 侧信号本就没被动过,但内存脏标已经被上面 Swap 掉了,
+		// 若直接 return 会白白丢失该信号,所以找补回去,下个 tick 重新判断。
+		if dirty {
+			mgr.MarkAuthzDirty()
+		}
+		return
+	}
+	if hadFlags {
+		if err := r.ClearAllNeedsAuthzPush(); err != nil {
+			log.Warn("authz push retry: clear needs_authz_push failed", zap.Error(err))
+		}
+	}
+	if !dirty && !hadFlags {
+		return
+	}
+
+	// 第 2 步:取快照。
+	all, err := r.List()
+	if err != nil {
+		log.Warn("authz push retry: list roots failed", zap.Error(err))
+		mgr.MarkAuthzDirty()
+		return
+	}
+	grants := make([]rootsync.Grant, 0, len(all))
+	for _, root := range all {
+		grants = append(grants, rootsync.Grant{RootID: root.ID, Path: root.Path, Enabled: root.Enabled})
+	}
+
+	// 第 3 步:后对账。
+	if err := rs.Reconcile(ctx, grants); err != nil {
+		// 第 4 步:失败重挂——信号已在第 1 步消费,这里只需重新置位内存脏标,
+		// 下个 tick 会因 dirty=true 再次触发全量 Reconcile。
+		log.Warn("authz push retry: reconcile failed; will retry next tick", zap.Error(err))
+		mgr.MarkAuthzDirty()
+		return
+	}
+	// 成功:两类信号都已在第 1 步消费完毕,这里无需再做任何清理。
 }
 
 func listEnabled(r *repo.WikiRootsRepo) []repo.WikiRoot {

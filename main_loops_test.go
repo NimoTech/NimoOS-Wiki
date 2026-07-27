@@ -10,6 +10,8 @@ import (
 	"github.com/NimoTech/NimoOS-Wiki/pkg/db"
 	"github.com/NimoTech/NimoOS-Wiki/pkg/ignore"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
+	"github.com/NimoTech/NimoOS-Wiki/service/roots"
+	"github.com/NimoTech/NimoOS-Wiki/service/rootsync"
 	"github.com/NimoTech/NimoOS-Wiki/service/scanner"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -165,4 +167,160 @@ func TestReconcileTickSkipsStormingRoot(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, g.NeedsReconcile, "storming root must not be drained")
 	require.Equal(t, now, g.LastScanAt, "storming root's last_scan must be untouched")
+}
+
+// --- authzPushRetryTick 覆盖(Critical 修复,方案 B:独立重试字段 + 专用重试
+// 循环)。构造方式照抄上面 reconcileTick 的测试:内存 sqlite + fake 依赖。
+
+// fakeAuthzReconciler 记录每次 Reconcile 调用的参数(grants 数量),
+// 供断言重试循环是否触发、以及触发时机;errToReturn 控制成功/失败分支。
+type fakeAuthzReconciler struct {
+	calls       []int // 每次调用时的 grants 长度
+	errToReturn error
+}
+
+func (f *fakeAuthzReconciler) Reconcile(_ context.Context, grants []rootsync.Grant) error {
+	f.calls = append(f.calls, len(grants))
+	return f.errToReturn
+}
+
+// failingPusher 是 roots.Manager 的 pusher 依赖测试替身,Upsert/Delete 均失败,
+// 用于驱动 manager 产生 needs_authz_push / authzDirty 信号。
+type failingPusher struct{ err error }
+
+func (p failingPusher) Upsert(context.Context, rootsync.Grant) error { return p.err }
+func (p failingPusher) Delete(context.Context, string) error         { return p.err }
+
+func TestAuthzPushRetryTick_NoOpWhenNothingPending(t *testing.T) {
+	d := openMainTestDB(t)
+	rRoots := repo.NewWikiRoots(d)
+	mgr := roots.NewManager(rRoots, repo.NewWikiNodes(d), repo.NewFileIndex(d), repo.NewFileEvents(d), nil, nil)
+
+	fr := &fakeAuthzReconciler{}
+	authzPushRetryTick(context.Background(), rRoots, fr, mgr, zap.NewNop())
+
+	require.Empty(t, fr.calls, "无待推信号时不应触发 Reconcile")
+}
+
+func TestAuthzPushRetryTick_DBFlagTriggersReconcileAndClearsOnSuccess(t *testing.T) {
+	d := openMainTestDB(t)
+	rRoots := repo.NewWikiRoots(d)
+	mgr := roots.NewManager(rRoots, repo.NewWikiNodes(d), repo.NewFileIndex(d), repo.NewFileEvents(d), nil, nil)
+
+	now := time.Now().UnixMilli()
+	require.NoError(t, rRoots.Insert(repo.WikiRoot{
+		ID: "r1", Path: "/a", Level: "space", WatchMode: "auto",
+		StorageMode: "inline", Enabled: true, ScanIntervalS: 600, CreatedAt: now,
+	}))
+	require.NoError(t, rRoots.SetNeedsAuthzPush("r1", true))
+
+	fr := &fakeAuthzReconciler{}
+	authzPushRetryTick(context.Background(), rRoots, fr, mgr, zap.NewNop())
+
+	require.Len(t, fr.calls, 1, "存在 needs_authz_push 行应触发一次全量 Reconcile")
+	require.Equal(t, 1, fr.calls[0])
+
+	g, err := rRoots.Get("r1")
+	require.NoError(t, err)
+	require.False(t, g.NeedsAuthzPush, "Reconcile 成功后标记应被清除")
+}
+
+// TestAuthzPushRetryTick_ReconcileFailureConsumesDBFlagAndRemarksMemoryDirty
+// 是「失败保留标记」用例在 consume-then-act 加固后的新语义:DB 的
+// needs_authz_push 标记在第 1 步(消费信号)就已经被 blanket clear 掉,不再
+// 由 Reconcile 的成败决定去留;Reconcile 失败时改为重新置位内存脏标
+// authzDirty,交给下个 tick 靠它触发全量 Reconcile 重试。
+func TestAuthzPushRetryTick_ReconcileFailureConsumesDBFlagAndRemarksMemoryDirty(t *testing.T) {
+	d := openMainTestDB(t)
+	rRoots := repo.NewWikiRoots(d)
+	mgr := roots.NewManager(rRoots, repo.NewWikiNodes(d), repo.NewFileIndex(d), repo.NewFileEvents(d), nil, nil)
+
+	now := time.Now().UnixMilli()
+	require.NoError(t, rRoots.Insert(repo.WikiRoot{
+		ID: "r1", Path: "/a", Level: "space", WatchMode: "auto",
+		StorageMode: "inline", Enabled: true, ScanIntervalS: 600, CreatedAt: now,
+	}))
+	require.NoError(t, rRoots.SetNeedsAuthzPush("r1", true))
+
+	fr := &fakeAuthzReconciler{errToReturn: fmt.Errorf("core unreachable")}
+	authzPushRetryTick(context.Background(), rRoots, fr, mgr, zap.NewNop())
+
+	require.Len(t, fr.calls, 1)
+	g, err := rRoots.Get("r1")
+	require.NoError(t, err)
+	require.False(t, g.NeedsAuthzPush,
+		"consume-then-act:DB 标记在第 1 步已被消费清除,不再由 Reconcile 成败决定")
+	require.True(t, mgr.AuthzDirty(),
+		"Reconcile 失败应重新置位内存脏标,下个 tick 靠它重试")
+}
+
+// windowRaceReconciler 在 Reconcile 被调用的回调里模拟"窗口期又发生了一次
+// 独立推送失败":真实场景是另一个 goroutine(pushUpsert)恰好在本 tick 消费
+// 信号之后、Reconcile 返回之前,针对另一个 root 推送失败又置了一次新信号。
+// 用于验证加固后新信号不会被本轮 tick 的 blanket clear 误吞。
+type windowRaceReconciler struct {
+	rRoots    *repo.WikiRootsRepo
+	newRootID string
+	calls     int
+}
+
+func (f *windowRaceReconciler) Reconcile(_ context.Context, _ []rootsync.Grant) error {
+	f.calls++
+	_ = f.rRoots.SetNeedsAuthzPush(f.newRootID, true)
+	return nil
+}
+
+// TestAuthzPushRetryTick_WindowSignalNotSwallowedByBlanketClear 是本次
+// consume-then-act 加固的核心回归测试:验证「快照之后、清位之前」窗口期内
+// 产生的新信号,不会被本轮 tick 的清位动作吞掉——必须留到下个 tick 收敛。
+func TestAuthzPushRetryTick_WindowSignalNotSwallowedByBlanketClear(t *testing.T) {
+	d := openMainTestDB(t)
+	rRoots := repo.NewWikiRoots(d)
+	mgr := roots.NewManager(rRoots, repo.NewWikiNodes(d), repo.NewFileIndex(d), repo.NewFileEvents(d), nil, nil)
+
+	now := time.Now().UnixMilli()
+	require.NoError(t, rRoots.Insert(repo.WikiRoot{
+		ID: "r1", Path: "/a", Level: "space", WatchMode: "auto",
+		StorageMode: "inline", Enabled: true, ScanIntervalS: 600, CreatedAt: now,
+	}))
+	require.NoError(t, rRoots.Insert(repo.WikiRoot{
+		ID: "r2", Path: "/b", Level: "space", WatchMode: "auto",
+		StorageMode: "inline", Enabled: true, ScanIntervalS: 600, CreatedAt: now,
+	}))
+	require.NoError(t, rRoots.SetNeedsAuthzPush("r1", true))
+
+	fr := &windowRaceReconciler{rRoots: rRoots, newRootID: "r2"}
+	authzPushRetryTick(context.Background(), rRoots, fr, mgr, zap.NewNop())
+
+	require.Equal(t, 1, fr.calls)
+
+	g1, err := rRoots.Get("r1")
+	require.NoError(t, err)
+	require.False(t, g1.NeedsAuthzPush, "本轮已消费的旧信号应正常清除")
+
+	g2, err := rRoots.Get("r2")
+	require.NoError(t, err)
+	require.True(t, g2.NeedsAuthzPush,
+		"核心回归:窗口期(消费之后)新产生的信号不应被本轮 blanket clear 误吞,"+
+			"必须留到下个 tick 再收敛")
+}
+
+func TestAuthzPushRetryTick_MemoryDirtyFlagTriggersReconcileAndClearsOnSuccess(t *testing.T) {
+	d := openMainTestDB(t)
+	rRoots := repo.NewWikiRoots(d)
+	mgr := roots.NewManager(rRoots, repo.NewWikiNodes(d), repo.NewFileIndex(d), repo.NewFileEvents(d), nil, nil)
+
+	dir := t.TempDir()
+	id, _, err := mgr.Create(roots.CreateArgs{Path: dir, Level: "space"})
+	require.NoError(t, err)
+
+	mgr.SetPusher(failingPusher{err: fmt.Errorf("boom")})
+	require.NoError(t, mgr.Delete(id, false))
+	require.True(t, mgr.AuthzDirty(), "delete 推送失败应置内存脏标")
+
+	fr := &fakeAuthzReconciler{}
+	authzPushRetryTick(context.Background(), rRoots, fr, mgr, zap.NewNop())
+
+	require.Len(t, fr.calls, 1, "内存脏标也应触发一次全量 Reconcile")
+	require.False(t, mgr.AuthzDirty(), "Reconcile 成功后内存脏标应被清除")
 }

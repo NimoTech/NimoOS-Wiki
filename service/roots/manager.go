@@ -3,19 +3,34 @@
 package roots
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/NimoTech/NimoOS-Wiki/common"
 	"github.com/NimoTech/NimoOS-Wiki/pkg/ignore"
 	"github.com/NimoTech/NimoOS-Wiki/service/eventbus"
 	"github.com/NimoTech/NimoOS-Wiki/service/repo"
+	"github.com/NimoTech/NimoOS-Wiki/service/rootsync"
 	"github.com/NimoTech/NimoOS-Wiki/service/scanner"
+	"go.uber.org/zap"
 )
+
+// pushTimeout 是 manager 向核心增量推送(Upsert/Delete)单次调用的超时:核心是
+// 内网服务,3s 足够;超时也按失败处理,交由调用方置 needs_reconcile。
+const pushTimeout = 3 * time.Second
+
+// pusher 是 manager 对核心授权推送的最小依赖(便于测试注入 fake pusher,
+// 也避免 manager 直接依赖 rootsync.Client 的完整实现细节)。
+type pusher interface {
+	Upsert(ctx context.Context, g rootsync.Grant) error
+	Delete(ctx context.Context, rootID string) error
+}
 
 type Manager struct {
 	roots  *repo.WikiRootsRepo
@@ -25,6 +40,20 @@ type Manager struct {
 	bus    eventbus.Bus
 	watch  Watch
 	ig     *ignore.Matcher
+
+	// pusher 推送 root 生命周期变化给核心授权源(授权源解耦项目);nil(测试、
+	// 未接线场景)意味着跳过推送,启动时的全量 Reconcile 仍会兜底。
+	pusher pusher
+	// log 用于推送失败时的 Warn;默认 no-op,main 通过 SetLogger 注入真实 logger。
+	log *zap.Logger
+
+	// authzDirty 是 pushDelete 失败时的内存脏标(Critical 修复,方案 B):delete
+	// 失败时该 root 行已经被删,DB 里无处落盘持久标记,只能靠这个内存标志告诉
+	// main.go 的专用重试循环"存在待纠正的授权残留",下一轮 tick 用全量幂等
+	// Reconcile 兜底;重启则天然由 bootReconcileRootSync 的启动全量对账覆盖,
+	// 无需持久化。原子操作:pushDelete 在业务 goroutine 里写,重试循环在自己的
+	// goroutine 里读/清,避免数据竞争。
+	authzDirty atomic.Bool
 
 	// PrecheckDirLimit / PrecheckTimeout bound the size precheck run in
 	// Create (spec §4.4). Zero-value PrecheckDirLimit skips the precheck
@@ -41,8 +70,76 @@ func NewManager(roots *repo.WikiRootsRepo, nodes *repo.WikiNodesRepo,
 	if bus == nil {
 		bus = eventbus.Noop{}
 	}
-	return &Manager{roots: roots, nodes: nodes, files: files, events: events, bus: bus, ig: ig}
+	return &Manager{roots: roots, nodes: nodes, files: files, events: events, bus: bus, ig: ig, log: zap.NewNop()}
 }
+
+// SetPusher wires the core-authority push client (called once from main,
+// after rootsync.New()). Nil (tests, CLI) means push is skipped.
+func (m *Manager) SetPusher(p pusher) { m.pusher = p }
+
+// SetLogger wires the process-wide zap logger (called once from main).
+// A nil argument is ignored, keeping the no-op default from NewManager.
+func (m *Manager) SetLogger(l *zap.Logger) {
+	if l != nil {
+		m.log = l
+	}
+}
+
+// pushUpsert 尽力而为地把 root 的当前状态(id/path/enabled)推给核心。推送
+// 失败(网络错误、核心未就绪、超时等)仅记录 Warn 并把该 root 标记为
+// needs_authz_push(Critical 修复,方案 B:独立字段,不再误用 FS 重扫语义的
+// needs_reconcile)——不返回 error、不阻塞调用方,与既有 MessageBus 软依赖同一
+// 哲学;真正的重试由 main.go 的专用授权推送重试循环消费该标记,统一走全量
+// 幂等 Reconcile 纠正。
+func (m *Manager) pushUpsert(id, path string, enabled bool) {
+	if m.pusher == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), pushTimeout)
+	defer cancel()
+	g := rootsync.Grant{RootID: id, Path: path, Enabled: enabled}
+	if err := m.pusher.Upsert(ctx, g); err != nil {
+		m.log.Warn("push root grant upsert failed; marked needs_authz_push",
+			zap.String("root_id", id), zap.Error(err))
+		_ = m.roots.SetNeedsAuthzPush(id, true)
+	}
+}
+
+// pushDelete 尽力而为地把 root 删除同步给核心;失败时该 root 行已被
+// m.roots.Delete 删除,DB 里没有行可落 needs_authz_push 标记,于是改置内存脏标
+// authzDirty,交给重试循环靠全量 Reconcile 兜底(见 authzDirty 字段注释)。
+func (m *Manager) pushDelete(id string) {
+	if m.pusher == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), pushTimeout)
+	defer cancel()
+	if err := m.pusher.Delete(ctx, id); err != nil {
+		m.log.Warn("push root grant delete failed; marked authz dirty",
+			zap.String("root_id", id), zap.Error(err))
+		m.authzDirty.Store(true)
+	}
+}
+
+// AuthzDirty 报告是否存在因 pushDelete 失败而产生的、无法持久化的授权残留
+// 待纠正信号,供 main.go 的专用重试循环判断本轮 tick 是否需要触发一次全量
+// Reconcile。
+func (m *Manager) AuthzDirty() bool { return m.authzDirty.Load() }
+
+// ClearAuthzDirty 清除内存脏标,在重试循环里的全量 Reconcile 成功后调用。
+func (m *Manager) ClearAuthzDirty() { m.authzDirty.Store(false) }
+
+// ConsumeAuthzDirty 原子地读取并清空内存脏标(Swap 到 false),供重试循环的
+// consume-then-act 加固使用:tick 一开始就把信号"消费掉",而不是等 Reconcile
+// 跑完才 blanket clear——这样窗口期(消费之后)新产生的信号不会被本轮 tick
+// 误吞。若消费之后本轮实际未能完成对账(List/Reconcile 失败),调用方需用
+// MarkAuthzDirty 把信号找补回去,交给下个 tick 重试。
+func (m *Manager) ConsumeAuthzDirty() bool { return m.authzDirty.Swap(false) }
+
+// MarkAuthzDirty 重新置位内存脏标。用于重试循环在 ConsumeAuthzDirty 消费了
+// 信号之后,却因 List/Reconcile 失败未能真正完成对账时,把信号找补回去,
+// 避免因 consume-then-act 的重排而丢失待纠正的授权漂移。
+func (m *Manager) MarkAuthzDirty() { m.authzDirty.Store(true) }
 
 // Watch is the subset of scanner.Watcher the Manager drives when roots are
 // created, deleted, enabled or disabled at runtime. Nil (tests, CLI) means
@@ -204,6 +301,8 @@ func (m *Manager) Create(args CreateArgs) (string, string, error) {
 		"level":   args.Level,
 	})
 
+	m.pushUpsert(id, args.Path, true)
+
 	return id, modeReason, nil
 }
 
@@ -289,6 +388,9 @@ func (m *Manager) Delete(id string, purgeFiles bool) error {
 		"path":    root.Path,
 		"level":   root.Level,
 	})
+
+	m.pushDelete(id)
+
 	return nil
 }
 
@@ -335,6 +437,9 @@ func (m *Manager) SetEnabled(id string, enabled bool) error {
 		}
 		m.bus.Publish(common.EventRootDisabled, payload)
 	}
+
+	m.pushUpsert(id, root.Path, enabled)
+
 	return nil
 }
 

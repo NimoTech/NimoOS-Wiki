@@ -58,7 +58,6 @@ func InitRouter(d Deps) *echo.Echo {
 	i.GET("/node-evidence", getInternalNodeEvidence(d))
 	i.POST("/summary", postInternalSummary(d))
 	i.POST("/index-status", stubServiceUnavailable)
-	i.GET("/user-roots", getInternalUserRoots(d))
 
 	return e
 }
