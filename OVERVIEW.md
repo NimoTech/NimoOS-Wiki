@@ -2,7 +2,7 @@
 
 NimoOS 的「可见长期记忆」服务 — 在用户的存储空间里维护 `.wiki.md` 导航地图，让用户和 Agent 都能直接读到「NAS 里有什么、在哪里、属于什么主题」。当前版本 `v1.9.0-alpha1`(`common/constants.go`,随 NimoOS 全家桶统一版号)。
 
-绑定 localhost、由 Gateway 转发，API 前缀 `/v1/wiki`。详细设计见 [`nimo_os_docs/docs/superpowers/specs/2026-05-13-wiki-design.md`](../nimo_os_docs/docs/superpowers/specs/2026-05-13-wiki-design.md)。
+绑定 localhost、由 Gateway 转发，API 前缀 `/v1/wiki`。详细设计见 内部设计稿 `2026-05-13-wiki-design.md`。
 
 ---
 
@@ -228,10 +228,10 @@ cd NimoOS-Wiki && CGO_ENABLED=1 go build -o nimoos-wiki .
 goreleaser release --snapshot --clean
 
 # 一键安装到系统(systemd unit + conf + binary + enable)
-sudo bash nimo_os_docs/scripts/install-wiki.sh --start
+sudo bash scripts/install-wiki.sh --start
 
 # 更新已部署的服务(只换二进制 + 重启)
-bash nimo_os_docs/scripts/deploy.sh wiki
+bash scripts/deploy.sh wiki
 
 # 跑测试
 go test ./...                              # 单元 + repo
@@ -329,7 +329,7 @@ go test -tags integration ./tests/...      # E2E (~10s,涉及 fsnotify)
 ### D. 修复优先级建议(我个人排序)
 
 **已完成(2026-05-20):**
-- ✅ B 区:WikiWriter ↔ reverse-sync 时序、服务停机期间外部编辑、事件聚合 → 修复(详见 `nimo_os_docs/docs/superpowers/plans/2026-05-20-wiki-reliability-fixes.md`)
+- ✅ B 区:WikiWriter ↔ reverse-sync 时序、服务停机期间外部编辑、事件聚合 → 修复(详见 内部设计稿)
 - ✅ A 区:`Wiki:RootEnabled` / `Wiki:RootDisabled` 事件 → 已实施
 
 **已完成(2026-05-21 ~ 2026-05-25):**
