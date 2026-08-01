@@ -51,7 +51,7 @@ func TestNeedsSummary_ReturnsUnsummarizedNodes(t *testing.T) {
 	}))
 	require.NoError(t, mgrs.Nodes.Upsert(repo.WikiNode{
 		ID: "n2", RootID: &rootID, Path: "/b", Level: "project",
-		AILabel: "已生成", LastModified: 200, UpdatedAt: 1, ChildCount: 3,
+		AILabel: "generated", LastModified: 200, UpdatedAt: 1, ChildCount: 3,
 	}))
 	require.NoError(t, mgrs.Summaries.Upsert(repo.WikiSummary{
 		Path: "/b", Summary: "x", GeneratedAt: 200,

@@ -405,12 +405,13 @@ func TestDeleteCascadesFileIndexAndEmitsTombstones(t *testing.T) {
 
 	require.NoError(t, m.Delete(id, false))
 
-	// file_index 级联清空
+	// file_index is cascade-cleared
 	rows, err := rFiles.ListByRootAfter(id, "", 100)
 	require.NoError(t, err)
 	require.Empty(t, rows)
 
-	// 旧 create 事件被清;每个文件(不含目录)有一条预标 processed 的 delete tombstone
+	// old create events are purged; each file (excluding directories) gets one
+	// pre-marked-processed delete tombstone
 	evs, err := rEvents.ListSince(id, 0, 100)
 	require.NoError(t, err)
 	var tombs []repo.FileEvent

@@ -15,7 +15,7 @@ func TestCountUnprocessedByRoot(t *testing.T) {
 		mustInsert(t, ev, "rootA", fmt.Sprintf("/a/%d", i))
 	}
 	mustInsert(t, ev, "rootB", "/b/0")
-	// 一条已处理的不计
+	// a processed row shouldn't be counted
 	e := FileEvent{ID: NewID(), RootID: "rootA", Path: "/a/x", Op: "create", DetectedAt: 1}
 	require.NoError(t, ev.Insert(e))
 	require.NoError(t, ev.MarkProcessed([]string{e.ID}, 2))
@@ -26,13 +26,13 @@ func TestCountUnprocessedByRoot(t *testing.T) {
 
 	total, err := ev.CountAll()
 	require.NoError(t, err)
-	require.EqualValues(t, 5, total) // CountAll 计全表(含已处理)
+	require.EqualValues(t, 5, total) // CountAll counts the whole table (including processed)
 }
 
 func TestPurgeOldestOverCap(t *testing.T) {
 	d := openTestDB(t)
 	ev := NewFileEvents(d)
-	// 10 行,detected_at 1..10,root 交替
+	// 10 rows, detected_at 1..10, alternating root
 	for i := 1; i <= 10; i++ {
 		root := "rootA"
 		if i%2 == 0 {
@@ -45,11 +45,11 @@ func TestPurgeOldestOverCap(t *testing.T) {
 	}
 	purged, roots, err := ev.PurgeOldestOverCap(6)
 	require.NoError(t, err)
-	require.EqualValues(t, 4, purged) // 删最老的 4 行(detected_at 1..4)
+	require.EqualValues(t, 4, purged) // deletes the 4 oldest rows (detected_at 1..4)
 	require.ElementsMatch(t, []string{"rootA", "rootB"}, roots)
 	total, _ := ev.CountAll()
 	require.EqualValues(t, 6, total)
-	// 未超限时零动作
+	// no-op when under the cap
 	purged, roots, err = ev.PurgeOldestOverCap(100)
 	require.NoError(t, err)
 	require.Zero(t, purged)

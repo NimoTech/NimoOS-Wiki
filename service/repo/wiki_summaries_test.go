@@ -58,7 +58,7 @@ func TestSummaries_ListNeedsSummary_AILabelEmpty(t *testing.T) {
 	}))
 	require.NoError(t, n.Upsert(WikiNode{
 		ID: "n2", RootID: &rootID, Path: "/labeled", Level: "project",
-		AILabel: "已生成", LastModified: 50, UpdatedAt: 1,
+		AILabel: "generated", LastModified: 50, UpdatedAt: 1,
 	}))
 	require.NoError(t, s.Upsert(WikiSummary{
 		Path: "/empty", Summary: "x", GeneratedAt: 100,
@@ -80,7 +80,7 @@ func TestSummaries_ListNeedsSummary_StaleByLastModified(t *testing.T) {
 	rootID := "r"
 	require.NoError(t, n.Upsert(WikiNode{
 		ID: "n1", RootID: &rootID, Path: "/stale", Level: "project",
-		AILabel: "已生成", LastModified: 200, UpdatedAt: 1,
+		AILabel: "generated", LastModified: 200, UpdatedAt: 1,
 	}))
 	require.NoError(t, s.Upsert(WikiSummary{
 		Path: "/stale", Summary: "x", GeneratedAt: 100,
@@ -98,7 +98,7 @@ func TestSummaries_ListNeedsSummary_NoSummary(t *testing.T) {
 	rootID := "r"
 	require.NoError(t, n.Upsert(WikiNode{
 		ID: "n1", RootID: &rootID, Path: "/fresh", Level: "project",
-		AILabel: "已生成", LastModified: 200, UpdatedAt: 1,
+		AILabel: "generated", LastModified: 200, UpdatedAt: 1,
 	}))
 	// node exists, no summary row → based_on_last_modified IS NULL → in queue
 	rows, err := s.ListNeedsSummary(10)

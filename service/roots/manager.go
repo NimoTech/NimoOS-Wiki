@@ -21,12 +21,15 @@ import (
 	"go.uber.org/zap"
 )
 
-// pushTimeout 是 manager 向核心增量推送(Upsert/Delete)单次调用的超时:核心是
-// 内网服务,3s 足够;超时也按失败处理,交由调用方置 needs_reconcile。
+// pushTimeout is the per-call timeout for the manager's incremental push
+// (Upsert/Delete) to core: core is a LAN-local service, so 3s is plenty; a
+// timeout is treated as a failure too, leaving the caller to set
+// needs_reconcile.
 const pushTimeout = 3 * time.Second
 
-// pusher 是 manager 对核心授权推送的最小依赖(便于测试注入 fake pusher,
-// 也避免 manager 直接依赖 rootsync.Client 的完整实现细节)。
+// pusher is the manager's minimal dependency on the core authz push (makes it
+// easy for tests to inject a fake pusher, and keeps the manager from
+// depending on rootsync.Client's full implementation details).
 type pusher interface {
 	Upsert(ctx context.Context, g rootsync.Grant) error
 	Delete(ctx context.Context, rootID string) error
@@ -41,18 +44,25 @@ type Manager struct {
 	watch  Watch
 	ig     *ignore.Matcher
 
-	// pusher 推送 root 生命周期变化给核心授权源(授权源解耦项目);nil(测试、
-	// 未接线场景)意味着跳过推送,启动时的全量 Reconcile 仍会兜底。
+	// pusher pushes root lifecycle changes to the core authz source (the
+	// authz-source-decoupling project); nil (tests, not-wired-up scenarios)
+	// means the push is skipped, and the startup full Reconcile still covers
+	// it.
 	pusher pusher
-	// log 用于推送失败时的 Warn;默认 no-op,main 通过 SetLogger 注入真实 logger。
+	// log is used to Warn on push failures; defaults to no-op, main injects
+	// the real logger via SetLogger.
 	log *zap.Logger
 
-	// authzDirty 是 pushDelete 失败时的内存脏标(Critical 修复,方案 B):delete
-	// 失败时该 root 行已经被删,DB 里无处落盘持久标记,只能靠这个内存标志告诉
-	// main.go 的专用重试循环"存在待纠正的授权残留",下一轮 tick 用全量幂等
-	// Reconcile 兜底;重启则天然由 bootReconcileRootSync 的启动全量对账覆盖,
-	// 无需持久化。原子操作:pushDelete 在业务 goroutine 里写,重试循环在自己的
-	// goroutine 里读/清,避免数据竞争。
+	// authzDirty is the in-memory dirty flag set when pushDelete fails
+	// (critical fix, option B): on delete failure the root row is already
+	// gone, so there's no row left in the DB to persist a marker on — the
+	// only way to tell main.go's dedicated retry loop "there's leftover authz
+	// state to correct" is this in-memory flag, which the next tick covers
+	// with a full idempotent Reconcile. On restart it's naturally covered by
+	// bootReconcileRootSync's startup full reconcile, so it never needs to be
+	// persisted. Atomic: pushDelete writes it from a business goroutine while
+	// the retry loop reads/clears it from its own goroutine, avoiding a data
+	// race.
 	authzDirty atomic.Bool
 
 	// PrecheckDirLimit / PrecheckTimeout bound the size precheck run in
@@ -85,12 +95,14 @@ func (m *Manager) SetLogger(l *zap.Logger) {
 	}
 }
 
-// pushUpsert 尽力而为地把 root 的当前状态(id/path/enabled)推给核心。推送
-// 失败(网络错误、核心未就绪、超时等)仅记录 Warn 并把该 root 标记为
-// needs_authz_push(Critical 修复,方案 B:独立字段,不再误用 FS 重扫语义的
-// needs_reconcile)——不返回 error、不阻塞调用方,与既有 MessageBus 软依赖同一
-// 哲学;真正的重试由 main.go 的专用授权推送重试循环消费该标记,统一走全量
-// 幂等 Reconcile 纠正。
+// pushUpsert best-effort pushes the root's current state (id/path/enabled) to
+// core. On failure (network error, core not ready, timeout, etc.) it only
+// Warns and marks the root needs_authz_push (critical fix, option B: a
+// dedicated field, no longer piggybacking on needs_reconcile's FS-rescan
+// semantics) — it never returns an error or blocks the caller, following the
+// same philosophy as the existing MessageBus soft dependency; the actual
+// retry is done by main.go's dedicated authz push retry loop, which consumes
+// this flag and corrects it via a full idempotent Reconcile.
 func (m *Manager) pushUpsert(id, path string, enabled bool) {
 	if m.pusher == nil {
 		return
@@ -105,9 +117,11 @@ func (m *Manager) pushUpsert(id, path string, enabled bool) {
 	}
 }
 
-// pushDelete 尽力而为地把 root 删除同步给核心;失败时该 root 行已被
-// m.roots.Delete 删除,DB 里没有行可落 needs_authz_push 标记,于是改置内存脏标
-// authzDirty,交给重试循环靠全量 Reconcile 兜底(见 authzDirty 字段注释)。
+// pushDelete best-effort syncs a root deletion to core; on failure the root
+// row has already been removed by m.roots.Delete, so there's no row left in
+// the DB to mark needs_authz_push on — instead it sets the in-memory dirty
+// flag authzDirty, leaving the retry loop to cover it via a full Reconcile
+// (see the authzDirty field comment).
 func (m *Manager) pushDelete(id string) {
 	if m.pusher == nil {
 		return
@@ -121,24 +135,31 @@ func (m *Manager) pushDelete(id string) {
 	}
 }
 
-// AuthzDirty 报告是否存在因 pushDelete 失败而产生的、无法持久化的授权残留
-// 待纠正信号,供 main.go 的专用重试循环判断本轮 tick 是否需要触发一次全量
-// Reconcile。
+// AuthzDirty reports whether there's a pending, non-persistable authz
+// leftover to correct (raised when pushDelete failed), for main.go's
+// dedicated retry loop to decide whether this tick needs to trigger a full
+// Reconcile.
 func (m *Manager) AuthzDirty() bool { return m.authzDirty.Load() }
 
-// ClearAuthzDirty 清除内存脏标,在重试循环里的全量 Reconcile 成功后调用。
+// ClearAuthzDirty clears the in-memory dirty flag; called after a successful
+// full Reconcile in the retry loop.
 func (m *Manager) ClearAuthzDirty() { m.authzDirty.Store(false) }
 
-// ConsumeAuthzDirty 原子地读取并清空内存脏标(Swap 到 false),供重试循环的
-// consume-then-act 加固使用:tick 一开始就把信号"消费掉",而不是等 Reconcile
-// 跑完才 blanket clear——这样窗口期(消费之后)新产生的信号不会被本轮 tick
-// 误吞。若消费之后本轮实际未能完成对账(List/Reconcile 失败),调用方需用
-// MarkAuthzDirty 把信号找补回去,交给下个 tick 重试。
+// ConsumeAuthzDirty atomically reads and clears the in-memory dirty flag
+// (swaps it to false), for the retry loop's consume-then-act hardening: the
+// signal is "consumed" right at the start of the tick, instead of waiting for
+// Reconcile to finish before doing a blanket clear — this way a signal raised
+// in the window after consumption isn't swallowed by the current tick. If the
+// tick ends up not actually completing the reconcile (List/Reconcile failed),
+// the caller must use MarkAuthzDirty to re-raise the signal for the next tick
+// to retry.
 func (m *Manager) ConsumeAuthzDirty() bool { return m.authzDirty.Swap(false) }
 
-// MarkAuthzDirty 重新置位内存脏标。用于重试循环在 ConsumeAuthzDirty 消费了
-// 信号之后,却因 List/Reconcile 失败未能真正完成对账时,把信号找补回去,
-// 避免因 consume-then-act 的重排而丢失待纠正的授权漂移。
+// MarkAuthzDirty re-raises the in-memory dirty flag. Used when the retry loop
+// has consumed the signal via ConsumeAuthzDirty but then failed to actually
+// complete the reconcile (List/Reconcile failed), so the signal must be
+// re-raised — otherwise the consume-then-act reordering would lose a pending
+// authz drift correction.
 func (m *Manager) MarkAuthzDirty() { m.authzDirty.Store(true) }
 
 // Watch is the subset of scanner.Watcher the Manager drives when roots are

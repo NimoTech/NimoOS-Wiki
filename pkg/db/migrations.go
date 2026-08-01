@@ -133,8 +133,10 @@ func runMigrations(d *sql.DB) error {
 	if err := addColumnIfMissing(d, "wiki_roots", "needs_reconcile", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("add wiki_roots.needs_reconcile: %w", err)
 	}
-	// needs_authz_push:授权源解耦 Task 5 Critical 修复,与 needs_reconcile(FS
-	// 重扫信号)语义独立——标记 root 授权推送(Upsert)失败待独立重试循环纠正。
+	// needs_authz_push: authz-source-decoupling Task 5 critical fix, semantically
+	// independent from needs_reconcile (the FS-rescan signal) — marks that a
+	// root's authz push (Upsert) failed and is pending correction by the
+	// dedicated retry loop.
 	if err := addColumnIfMissing(d, "wiki_roots", "needs_authz_push", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return fmt.Errorf("add wiki_roots.needs_authz_push: %w", err)
 	}
