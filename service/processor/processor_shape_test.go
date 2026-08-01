@@ -13,8 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// 根因①:create 事件写 file_index 必须与 reconciler pass B 同形
-// (真实 mtime/size + ext),否则首次对账每文件白发一条 modify。
+// Root cause 1: the file_index row written by a create event must have the
+// same shape as reconciler pass B (real mtime/size + ext), otherwise the
+// first reconcile pass fires a spurious modify for every file.
 func TestCreateEventWritesReconcilerShape(t *testing.T) {
 	p, files, events, _, _ := setup(t)
 	dir := t.TempDir()
@@ -25,7 +26,7 @@ func TestCreateEventWritesReconcilerShape(t *testing.T) {
 
 	require.NoError(t, events.Insert(repo.FileEvent{
 		ID: repo.NewID(), RootID: "r", Path: fp, Op: "create",
-		DetectedAt: time.Now().UnixMilli() + 12345, // 故意 ≠ 真实 mtime
+		DetectedAt: time.Now().UnixMilli() + 12345, // deliberately != real mtime
 	}))
 	require.NoError(t, p.ProcessBatch(context.Background()))
 

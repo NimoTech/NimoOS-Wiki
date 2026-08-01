@@ -5,14 +5,20 @@ import (
 	"strings"
 )
 
-// fallbackBaseURL 是服务发现文件缺失或为空时使用的兜底地址。
-// 核心服务默认监听在本机 80 端口(见 Gateway 反代惯例),不放行 localhost 校验也走此地址。
+// fallbackBaseURL is the fallback address used when the service-discovery
+// file is missing or empty.
+// Core defaults to listening on localhost port 80 (per the Gateway reverse
+// proxy convention), and requests exempt from localhost checks also use this
+// address.
 const fallbackBaseURL = "http://127.0.0.1"
 
-// resolveBaseURL 每次请求前都重新读取一次服务发现文件解析出核心的 base URL。
-// 之所以不缓存,是因为核心重启后监听端口可能变化(见 nimoos.url 由核心启动时写入),
-// 每次请求读文件能保证始终打到当前存活的核心实例;文件缺失/读取失败/内容为空
-// 一律回退到 fallbackBaseURL,不让发现失败阻塞调用方(失败由上层置 needsReconcile 兜底)。
+// resolveBaseURL re-reads the service-discovery file before every request to
+// resolve core's base URL. It's not cached because core's listen port can
+// change across restarts (nimoos.url is written by core at startup); reading
+// the file on every request guarantees requests always hit the currently
+// live core instance. A missing file, a read failure, or empty content all
+// fall back to fallbackBaseURL, so a discovery failure never blocks the
+// caller (the failure is covered by the caller setting needsReconcile).
 func resolveBaseURL(discoveryFile string) string {
 	b, err := os.ReadFile(discoveryFile)
 	if err != nil {

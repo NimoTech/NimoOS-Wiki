@@ -13,7 +13,8 @@ import (
 	"github.com/NimoTech/NimoOS-Wiki/service/rootsync"
 )
 
-// writeURLFile 写一个临时的服务发现文件,内容为假核心地址。
+// writeURLFile writes a temp service-discovery file whose content is a fake
+// core address.
 func writeURLFile(t *testing.T, url string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -65,7 +66,8 @@ func TestReconcile_PostsAllGrants(t *testing.T) {
 	}
 }
 
-// TestDelete_HitsCorrectEndpoint 补充覆盖简报未直接给出的 Delete 方法路径/方法断言。
+// TestDelete_HitsCorrectEndpoint adds coverage for the Delete method's
+// path/method assertions, which the brief didn't spell out directly.
 func TestDelete_HitsCorrectEndpoint(t *testing.T) {
 	var gotMethod, gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -84,7 +86,8 @@ func TestDelete_HitsCorrectEndpoint(t *testing.T) {
 	}
 }
 
-// TestNonOKStatus_ReturnsError 覆盖非 2xx 返回 error 的语义,供上层置 needsReconcile。
+// TestNonOKStatus_ReturnsError covers the semantics of returning an error on
+// non-2xx, which the caller uses to set needsReconcile.
 func TestNonOKStatus_ReturnsError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -98,14 +101,16 @@ func TestNonOKStatus_ReturnsError(t *testing.T) {
 	}
 }
 
-// TestMissingDiscoveryFile_FallsBackToDefault 覆盖发现文件缺失时的 fallback 行为:
-// 请求应打到 fallback(http://127.0.0.1)而不是直接崩溃或报错发现失败。
+// TestMissingDiscoveryFile_FallsBackToDefault covers the fallback behavior
+// when the discovery file is missing: the request should hit the fallback
+// (http://127.0.0.1) instead of crashing or erroring out on the discovery
+// failure.
 func TestMissingDiscoveryFile_FallsBackToDefault(t *testing.T) {
 	dir := t.TempDir()
 	missing := filepath.Join(dir, "does-not-exist.url")
 
 	c := rootsync.New(missing)
-	ctx, cancel := context.WithTimeout(context.Background(), 200_000_000) // 200ms,fallback 地址必不可达,快速失败即可
+	ctx, cancel := context.WithTimeout(context.Background(), 200_000_000) // 200ms; the fallback address is guaranteed unreachable, a fast failure is fine
 	defer cancel()
 	err := c.Upsert(ctx, rootsync.Grant{RootID: "r1", Path: "/a", Enabled: true})
 	if err == nil {

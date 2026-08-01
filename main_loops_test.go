@@ -169,13 +169,15 @@ func TestReconcileTickSkipsStormingRoot(t *testing.T) {
 	require.Equal(t, now, g.LastScanAt, "storming root's last_scan must be untouched")
 }
 
-// --- authzPushRetryTick 覆盖(Critical 修复,方案 B:独立重试字段 + 专用重试
-// 循环)。构造方式照抄上面 reconcileTick 的测试:内存 sqlite + fake 依赖。
+// --- authzPushRetryTick coverage (critical fix, option B: dedicated retry
+// field + dedicated retry loop). Built the same way as the reconcileTick
+// tests above: in-memory sqlite + fake dependencies.
 
-// fakeAuthzReconciler 记录每次 Reconcile 调用的参数(grants 数量),
-// 供断言重试循环是否触发、以及触发时机;errToReturn 控制成功/失败分支。
+// fakeAuthzReconciler records the args of every Reconcile call (number of
+// grants), so tests can assert whether/when the retry loop fires;
+// errToReturn controls the success/failure branch.
 type fakeAuthzReconciler struct {
-	calls       []int // 每次调用时的 grants 长度
+	calls       []int // grants length on each call
 	errToReturn error
 }
 
@@ -184,8 +186,9 @@ func (f *fakeAuthzReconciler) Reconcile(_ context.Context, grants []rootsync.Gra
 	return f.errToReturn
 }
 
-// failingPusher 是 roots.Manager 的 pusher 依赖测试替身,Upsert/Delete 均失败,
-// 用于驱动 manager 产生 needs_authz_push / authzDirty 信号。
+// failingPusher is a test double for roots.Manager's pusher dependency, where
+// both Upsert/Delete fail, used to drive the manager into raising
+// needs_authz_push / authzDirty signals.
 type failingPusher struct{ err error }
 
 func (p failingPusher) Upsert(context.Context, rootsync.Grant) error { return p.err }
@@ -199,7 +202,7 @@ func TestAuthzPushRetryTick_NoOpWhenNothingPending(t *testing.T) {
 	fr := &fakeAuthzReconciler{}
 	authzPushRetryTick(context.Background(), rRoots, fr, mgr, zap.NewNop())
 
-	require.Empty(t, fr.calls, "无待推信号时不应触发 Reconcile")
+	require.Empty(t, fr.calls, "Reconcile should not fire when nothing is pending")
 }
 
 func TestAuthzPushRetryTick_DBFlagTriggersReconcileAndClearsOnSuccess(t *testing.T) {
@@ -217,19 +220,21 @@ func TestAuthzPushRetryTick_DBFlagTriggersReconcileAndClearsOnSuccess(t *testing
 	fr := &fakeAuthzReconciler{}
 	authzPushRetryTick(context.Background(), rRoots, fr, mgr, zap.NewNop())
 
-	require.Len(t, fr.calls, 1, "存在 needs_authz_push 行应触发一次全量 Reconcile")
+	require.Len(t, fr.calls, 1, "a needs_authz_push row should trigger one full Reconcile")
 	require.Equal(t, 1, fr.calls[0])
 
 	g, err := rRoots.Get("r1")
 	require.NoError(t, err)
-	require.False(t, g.NeedsAuthzPush, "Reconcile 成功后标记应被清除")
+	require.False(t, g.NeedsAuthzPush, "the marker should be cleared after a successful Reconcile")
 }
 
 // TestAuthzPushRetryTick_ReconcileFailureConsumesDBFlagAndRemarksMemoryDirty
-// 是「失败保留标记」用例在 consume-then-act 加固后的新语义:DB 的
-// needs_authz_push 标记在第 1 步(消费信号)就已经被 blanket clear 掉,不再
-// 由 Reconcile 的成败决定去留;Reconcile 失败时改为重新置位内存脏标
-// authzDirty,交给下个 tick 靠它触发全量 Reconcile 重试。
+// is the new semantics of the "keep marker on failure" case after the
+// consume-then-act hardening: the DB's needs_authz_push marker is already
+// blanket-cleared in step 1 (consuming the signal), so it's no longer
+// determined by whether Reconcile succeeds or fails; on Reconcile failure the
+// in-memory dirty flag authzDirty is re-raised instead, leaving the next tick
+// to trigger a full Reconcile retry via it.
 func TestAuthzPushRetryTick_ReconcileFailureConsumesDBFlagAndRemarksMemoryDirty(t *testing.T) {
 	d := openMainTestDB(t)
 	rRoots := repo.NewWikiRoots(d)
@@ -249,15 +254,17 @@ func TestAuthzPushRetryTick_ReconcileFailureConsumesDBFlagAndRemarksMemoryDirty(
 	g, err := rRoots.Get("r1")
 	require.NoError(t, err)
 	require.False(t, g.NeedsAuthzPush,
-		"consume-then-act:DB 标记在第 1 步已被消费清除,不再由 Reconcile 成败决定")
+		"consume-then-act: the DB marker was already consumed and cleared in step 1, no longer determined by Reconcile's success/failure")
 	require.True(t, mgr.AuthzDirty(),
-		"Reconcile 失败应重新置位内存脏标,下个 tick 靠它重试")
+		"a Reconcile failure should re-raise the in-memory dirty flag, for the next tick to retry via it")
 }
 
-// windowRaceReconciler 在 Reconcile 被调用的回调里模拟"窗口期又发生了一次
-// 独立推送失败":真实场景是另一个 goroutine(pushUpsert)恰好在本 tick 消费
-// 信号之后、Reconcile 返回之前,针对另一个 root 推送失败又置了一次新信号。
-// 用于验证加固后新信号不会被本轮 tick 的 blanket clear 误吞。
+// windowRaceReconciler simulates, in the callback invoked when Reconcile is
+// called, "another independent push failure happening in the window": the
+// real-world scenario is another goroutine (pushUpsert) failing to push for
+// a different root — raising a new signal — right after this tick consumed
+// its signal but before Reconcile returned. Used to verify that after the
+// hardening, the new signal isn't swallowed by this tick's blanket clear.
 type windowRaceReconciler struct {
 	rRoots    *repo.WikiRootsRepo
 	newRootID string
@@ -270,9 +277,11 @@ func (f *windowRaceReconciler) Reconcile(_ context.Context, _ []rootsync.Grant) 
 	return nil
 }
 
-// TestAuthzPushRetryTick_WindowSignalNotSwallowedByBlanketClear 是本次
-// consume-then-act 加固的核心回归测试:验证「快照之后、清位之前」窗口期内
-// 产生的新信号,不会被本轮 tick 的清位动作吞掉——必须留到下个 tick 收敛。
+// TestAuthzPushRetryTick_WindowSignalNotSwallowedByBlanketClear is the core
+// regression test for this consume-then-act hardening: verifies that a new
+// signal raised in the window "after the snapshot, before the clear" is not
+// swallowed by this tick's clear action — it must survive to be resolved by
+// the next tick.
 func TestAuthzPushRetryTick_WindowSignalNotSwallowedByBlanketClear(t *testing.T) {
 	d := openMainTestDB(t)
 	rRoots := repo.NewWikiRoots(d)
@@ -296,13 +305,13 @@ func TestAuthzPushRetryTick_WindowSignalNotSwallowedByBlanketClear(t *testing.T)
 
 	g1, err := rRoots.Get("r1")
 	require.NoError(t, err)
-	require.False(t, g1.NeedsAuthzPush, "本轮已消费的旧信号应正常清除")
+	require.False(t, g1.NeedsAuthzPush, "the old signal consumed this round should be cleared normally")
 
 	g2, err := rRoots.Get("r2")
 	require.NoError(t, err)
 	require.True(t, g2.NeedsAuthzPush,
-		"核心回归:窗口期(消费之后)新产生的信号不应被本轮 blanket clear 误吞,"+
-			"必须留到下个 tick 再收敛")
+		"core regression: a new signal raised in the window (after consumption) should not be swallowed by this tick's blanket clear, "+
+			"it must survive to be resolved by the next tick")
 }
 
 func TestAuthzPushRetryTick_MemoryDirtyFlagTriggersReconcileAndClearsOnSuccess(t *testing.T) {
@@ -316,11 +325,11 @@ func TestAuthzPushRetryTick_MemoryDirtyFlagTriggersReconcileAndClearsOnSuccess(t
 
 	mgr.SetPusher(failingPusher{err: fmt.Errorf("boom")})
 	require.NoError(t, mgr.Delete(id, false))
-	require.True(t, mgr.AuthzDirty(), "delete 推送失败应置内存脏标")
+	require.True(t, mgr.AuthzDirty(), "a delete push failure should set the in-memory dirty flag")
 
 	fr := &fakeAuthzReconciler{}
 	authzPushRetryTick(context.Background(), rRoots, fr, mgr, zap.NewNop())
 
-	require.Len(t, fr.calls, 1, "内存脏标也应触发一次全量 Reconcile")
-	require.False(t, mgr.AuthzDirty(), "Reconcile 成功后内存脏标应被清除")
+	require.Len(t, fr.calls, 1, "the in-memory dirty flag should also trigger one full Reconcile")
+	require.False(t, mgr.AuthzDirty(), "the in-memory dirty flag should be cleared after a successful Reconcile")
 }

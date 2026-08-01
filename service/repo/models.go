@@ -11,9 +11,11 @@ type WikiRoot struct {
 	CreatedAt      int64
 	LastScanAt     int64
 	NeedsReconcile bool
-	// NeedsAuthzPush 标记本行的核心授权推送(Upsert)曾经失败、待独立重试循环
-	// 用全量 Reconcile 纠正(授权源解耦 Task 5 Critical 修复:与 NeedsReconcile
-	// 语义无关——后者是 FS 重扫信号,详见 service/roots/manager.go pushUpsert)。
+	// NeedsAuthzPush marks that this row's core authz push (Upsert) once
+	// failed and is pending correction by the dedicated retry loop's full
+	// Reconcile (authz-source-decoupling Task 5 critical fix: unrelated to
+	// NeedsReconcile's semantics — the latter is the FS-rescan signal, see
+	// service/roots/manager.go pushUpsert).
 	NeedsAuthzPush bool
 }
 

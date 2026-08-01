@@ -69,7 +69,7 @@ func TestListSinceSeqPagesThroughSameMillisecond(t *testing.T) {
 
 	now := time.Now().UnixMilli()
 	var batch []FileEvent
-	for i := 0; i < 300; i++ { // 同一毫秒 300 条,单页 200 装不下
+	for i := 0; i < 300; i++ { // 300 rows in the same millisecond, doesn't fit in one 200-row page
 		batch = append(batch, FileEvent{
 			RootID: "r", Path: fmt.Sprintf("/f%03d", i), Op: "create", DetectedAt: now,
 		})

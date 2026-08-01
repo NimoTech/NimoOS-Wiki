@@ -1,11 +1,15 @@
-// Package rootsync 是 NimoOS-Wiki 向 NimoOS 核心推送 root 授权的 HTTP client。
+// Package rootsync is the HTTP client NimoOS-Wiki uses to push root
+// authorization to the NimoOS core.
 //
-// 授权源解耦背景:核心是唯一的授权权威(o_root_grants 表),Wiki 侧对 root 目录的
-// 增/删/启停操作需要把结果推给核心,核心据此决定 agent 能访问哪些目录。
-// 推送是尽力而为(best-effort):任何一次调用失败,均由调用方(Task 5 的 manager)
-// 将对应 root 标记为 needsReconcile,并在 Wiki 服务启动时做一次全量 Reconcile 兜底,
-// 因此本包不做重试/退避,只负责把单次 HTTP 调用的结果(2xx/非 2xx/网络错误)如实
-// 转换为 nil/error。
+// Authz-source decoupling background: core is the sole authorization
+// authority (the o_root_grants table); create/delete/enable/disable
+// operations on root directories on the Wiki side need to be pushed to core,
+// which decides which directories the agent can access based on that. The
+// push is best-effort: any failed call is marked needsReconcile on the
+// corresponding root by the caller (Task 5's manager), and covered by a full
+// Reconcile at Wiki service startup — so this package does no retry/backoff,
+// it just faithfully converts the result of a single HTTP call (2xx / non-2xx
+// / network error) into nil/error.
 package rootsync
 
 import (
@@ -17,27 +21,30 @@ import (
 	"time"
 )
 
-// requestTimeout 是单次推送请求的超时时间。核心是内网服务,3s 足够;
-// 超时也会被当作失败处理,交由调用方置 needsReconcile。
+// requestTimeout is the timeout for a single push request. Core is a
+// LAN-local service, so 3s is plenty; a timeout is also treated as a
+// failure, leaving the caller to set needsReconcile.
 const requestTimeout = 3 * time.Second
 
-// Grant 是推给核心的单条 root 授权记录,JSON tag 需与核心
-// /v1/nimoos/_internal/root-grants 系列端点的请求体字段精确对齐。
+// Grant is a single root authorization record pushed to core; its JSON tags
+// must exactly match the request-body fields of core's
+// /v1/nimoos/_internal/root-grants endpoints.
 type Grant struct {
 	RootID  string `json:"root_id"`
 	Path    string `json:"path"`
 	Enabled bool   `json:"enabled"`
 }
 
-// Client 是核心授权推送客户端。
+// Client is the core authz push client.
 type Client struct {
 	discoveryFile string
 	httpClient    *http.Client
 }
 
-// New 构造一个 Client。discoveryFile 是服务发现文件路径(核心启动时写入,
-// 记录当前核心监听地址),生产环境固定传 /var/run/nimoos/nimoos.url,
-// 测试可传任意临时文件路径以便注入假核心地址。
+// New builds a Client. discoveryFile is the service-discovery file path
+// (written by core at startup, recording core's current listen address);
+// production always passes /var/run/nimoos/nimoos.url, while tests can pass
+// any temp file path to inject a fake core address.
 func New(baseURLFile string) *Client {
 	return &Client{
 		discoveryFile: baseURLFile,
@@ -45,8 +52,8 @@ func New(baseURLFile string) *Client {
 	}
 }
 
-// Upsert 增量推送一条 root 授权(新建或更新),对应核心端点
-// PUT {base}/v1/nimoos/_internal/root-grants/{root_id}。
+// Upsert incrementally pushes one root grant (create or update), mapping to
+// the core endpoint PUT {base}/v1/nimoos/_internal/root-grants/{root_id}.
 func (c *Client) Upsert(ctx context.Context, g Grant) error {
 	body := struct {
 		Path    string `json:"path"`
@@ -56,16 +63,18 @@ func (c *Client) Upsert(ctx context.Context, g Grant) error {
 	return c.do(ctx, http.MethodPut, url, body)
 }
 
-// Delete 删除一条 root 授权,对应核心端点
-// DELETE {base}/v1/nimoos/_internal/root-grants/{root_id}。
+// Delete removes one root grant, mapping to the core endpoint
+// DELETE {base}/v1/nimoos/_internal/root-grants/{root_id}.
 func (c *Client) Delete(ctx context.Context, rootID string) error {
 	url := fmt.Sprintf("%s/v1/nimoos/_internal/root-grants/%s", resolveBaseURL(c.discoveryFile), rootID)
 	return c.do(ctx, http.MethodDelete, url, nil)
 }
 
-// Reconcile 全量对账推送(通常在 Wiki 服务启动时调用一次),对应核心端点
-// POST {base}/v1/nimoos/_internal/root-grants/reconcile,body 为
-// {"grants":[...]}。核心以此列表为准同步 source="wiki" 的所有行。
+// Reconcile pushes a full reconcile pass (typically called once at Wiki
+// service startup), mapping to the core endpoint
+// POST {base}/v1/nimoos/_internal/root-grants/reconcile with body
+// {"grants":[...]}. Core treats this list as authoritative and syncs all
+// rows with source="wiki".
 func (c *Client) Reconcile(ctx context.Context, grants []Grant) error {
 	body := struct {
 		Grants []Grant `json:"grants"`
@@ -74,8 +83,10 @@ func (c *Client) Reconcile(ctx context.Context, grants []Grant) error {
 	return c.do(ctx, http.MethodPost, url, body)
 }
 
-// do 是三个方法共用的请求发送逻辑:带短超时、JSON 编码请求体、非 2xx 状态码
-// 一律转换为 error(不解析响应体细节,调用方只关心成功/失败)。
+// do is the request-sending logic shared by all three methods: short
+// timeout, JSON-encoded request body, and any non-2xx status code is
+// converted to an error (response body details aren't parsed — the caller
+// only cares about success/failure).
 func (c *Client) do(ctx context.Context, method, url string, payload any) error {
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
@@ -84,7 +95,7 @@ func (c *Client) do(ctx context.Context, method, url string, payload any) error 
 	if payload != nil {
 		b, err := json.Marshal(payload)
 		if err != nil {
-			return fmt.Errorf("rootsync: 序列化请求体失败: %w", err)
+			return fmt.Errorf("rootsync: failed to marshal request body: %w", err)
 		}
 		reader = bytes.NewReader(b)
 	} else {
@@ -93,7 +104,7 @@ func (c *Client) do(ctx context.Context, method, url string, payload any) error 
 
 	req, err := http.NewRequestWithContext(ctx, method, url, reader)
 	if err != nil {
-		return fmt.Errorf("rootsync: 构造请求失败: %w", err)
+		return fmt.Errorf("rootsync: failed to build request: %w", err)
 	}
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -101,12 +112,12 @@ func (c *Client) do(ctx context.Context, method, url string, payload any) error 
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("rootsync: 请求核心失败: %w", err)
+		return fmt.Errorf("rootsync: request to core failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("rootsync: 核心返回非成功状态码 %d", resp.StatusCode)
+		return fmt.Errorf("rootsync: core returned non-success status code %d", resp.StatusCode)
 	}
 	return nil
 }

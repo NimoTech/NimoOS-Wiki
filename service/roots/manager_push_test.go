@@ -1,8 +1,10 @@
 package roots
 
-// 本文件测试 manager 三处生命周期方法(Create/SetEnabled/Delete)在成功写库
-// 后是否正确追加推送核心授权(授权源解耦项目 Task 5)。用 fakePusher 断言
-// 调用次数与参数,不依赖真实 rootsync HTTP client。
+// This file tests whether the manager's three lifecycle methods
+// (Create/SetEnabled/Delete), after successfully writing to the DB, also
+// correctly push the core authz grant (authz-source-decoupling project
+// Task 5). Uses fakePusher to assert call count and args, without depending
+// on the real rootsync HTTP client.
 
 import (
 	"context"
@@ -14,7 +16,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fakePusher 是 pusher 接口的测试替身,记录每次调用的参数供断言。
+// fakePusher is a test double for the pusher interface, recording the args
+// of each call for assertions.
 type fakePusher struct {
 	upserts []rootsync.Grant
 	deletes []string
@@ -30,8 +33,9 @@ func (f *fakePusher) Delete(_ context.Context, id string) error {
 	return nil
 }
 
-// newManagerWithFakePusher 构造一个带临时内存 wiki.db + fakePusher 的
-// manager,建库方式照抄 manager_test.go 的 setupManagerWithIgnore。
+// newManagerWithFakePusher builds a manager backed by a temp in-memory
+// wiki.db + fakePusher; DB setup is copied from manager_test.go's
+// setupManagerWithIgnore.
 func newManagerWithFakePusher(t *testing.T) (*Manager, *fakePusher) {
 	t.Helper()
 	d, err := db.Open(":memory:")
@@ -65,7 +69,7 @@ func TestSetEnabled_PushesUpsert(t *testing.T) {
 	dir := t.TempDir()
 	id, _, err := m.Create(CreateArgs{Path: dir, Level: "space"})
 	require.NoError(t, err)
-	fp.upserts = nil // 只看 SetEnabled 这次
+	fp.upserts = nil // only care about this SetEnabled call
 
 	require.NoError(t, m.SetEnabled(id, false))
 
@@ -87,32 +91,35 @@ func TestDelete_PushesDelete(t *testing.T) {
 	require.Equal(t, id, fp.deletes[0])
 }
 
-// pusherErr 是一个总是失败的 fake pusher,用于验证失败路径:仅置
-// needs_reconcile,不返回 error、不阻塞调用方。
+// pusherErr is a fake pusher that always fails, used to verify the failure
+// path: it only sets needs_reconcile, never returns an error or blocks the
+// caller.
 type pusherErr struct{ err error }
 
 func (p pusherErr) Upsert(context.Context, rootsync.Grant) error { return p.err }
 func (p pusherErr) Delete(context.Context, string) error         { return p.err }
 
-// TestCreate_PushFailureMarksNeedsAuthzPushButDoesNotFail 覆盖方案 B 的修复:
-// upsert 推送失败应置 needs_authz_push(独立重试字段),而不是误用 FS 重扫语义的
-// needs_reconcile(旧 bug,已修复)。
+// TestCreate_PushFailureMarksNeedsAuthzPushButDoesNotFail covers the option B
+// fix: an upsert push failure should set needs_authz_push (the dedicated
+// retry field), not incorrectly reuse needs_reconcile's FS-rescan semantics
+// (an old bug, now fixed).
 func TestCreate_PushFailureMarksNeedsAuthzPushButDoesNotFail(t *testing.T) {
 	m, rootsRepo := setupManager(t)
 	m.SetPusher(pusherErr{err: context.DeadlineExceeded})
 	dir := t.TempDir()
 
 	id, _, err := m.Create(CreateArgs{Path: dir, Level: "space"})
-	require.NoError(t, err) // 推送失败不影响 Create 本身成功
+	require.NoError(t, err) // a push failure doesn't affect Create's own success
 
 	r, err := rootsRepo.Get(id)
 	require.NoError(t, err)
 	require.True(t, r.NeedsAuthzPush)
-	require.False(t, r.NeedsReconcile, "upsert 推送失败不应再误置 FS 重扫标记")
+	require.False(t, r.NeedsReconcile, "an upsert push failure should no longer incorrectly set the FS-rescan marker")
 }
 
-// TestSetEnabled_PushFailureMarksNeedsAuthzPush 覆盖 SetEnabled 走的也是
-// pushUpsert 失败路径,同样只置 needs_authz_push。
+// TestSetEnabled_PushFailureMarksNeedsAuthzPush covers that SetEnabled also
+// goes through the pushUpsert failure path, likewise only setting
+// needs_authz_push.
 func TestSetEnabled_PushFailureMarksNeedsAuthzPush(t *testing.T) {
 	m, rootsRepo := setupManager(t)
 	dir := t.TempDir()
@@ -127,20 +134,22 @@ func TestSetEnabled_PushFailureMarksNeedsAuthzPush(t *testing.T) {
 	require.True(t, r.NeedsAuthzPush)
 }
 
-// TestDelete_PushFailureMarksAuthzDirtyButDoesNotFail 覆盖 delete 推送失败的
-// 独立路径:该 root 行此时已被删除,DB 里无处落盘,只能置 manager 内存脏标
-// (authzDirty),交给重试循环靠全量 Reconcile 兜底。
+// TestDelete_PushFailureMarksAuthzDirtyButDoesNotFail covers the separate
+// delete-push-failure path: at that point the root row has already been
+// deleted, so there's nowhere in the DB to persist a marker — the only
+// option is to set the manager's in-memory dirty flag (authzDirty), leaving
+// the retry loop to cover it via a full Reconcile.
 func TestDelete_PushFailureMarksAuthzDirtyButDoesNotFail(t *testing.T) {
 	m, _ := setupManager(t)
 	dir := t.TempDir()
 	id, _, err := m.Create(CreateArgs{Path: dir, Level: "space"})
 	require.NoError(t, err)
 
-	require.False(t, m.AuthzDirty(), "初始不应有脏标")
+	require.False(t, m.AuthzDirty(), "should not be dirty initially")
 	m.SetPusher(pusherErr{err: context.DeadlineExceeded})
 
-	require.NoError(t, m.Delete(id, false)) // 推送失败不影响 Delete 本身成功
-	require.True(t, m.AuthzDirty(), "delete 推送失败应置内存脏标")
+	require.NoError(t, m.Delete(id, false)) // a push failure doesn't affect Delete's own success
+	require.True(t, m.AuthzDirty(), "a delete push failure should set the in-memory dirty flag")
 
 	m.ClearAuthzDirty()
 	require.False(t, m.AuthzDirty())

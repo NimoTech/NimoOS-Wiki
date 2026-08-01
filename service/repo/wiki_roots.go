@@ -83,15 +83,17 @@ func (r *WikiRootsRepo) SetNeedsReconcile(id string, v bool) error {
 	return err
 }
 
-// SetNeedsAuthzPush 标记(或清除)单个 root 的授权推送待重试状态(授权源解耦
-// Task 5 Critical 修复:与 SetNeedsReconcile 是两个独立字段,互不影响)。
+// SetNeedsAuthzPush marks (or clears) a single root's pending-authz-push-retry
+// state (authz-source-decoupling Task 5 critical fix: an independent field
+// from SetNeedsReconcile, the two don't affect each other).
 func (r *WikiRootsRepo) SetNeedsAuthzPush(id string, v bool) error {
 	_, err := r.db.Exec(`UPDATE wiki_roots SET needs_authz_push = ? WHERE id = ?`, b2i(v), id)
 	return err
 }
 
-// HasNeedsAuthzPush 报告是否存在至少一行待重推的 root 授权记录,供重试循环
-// 判断本轮 tick 是否需要触发一次全量 Reconcile(无标记时零成本跳过)。
+// HasNeedsAuthzPush reports whether at least one root's authz grant is
+// pending repush, for the retry loop to decide whether this tick needs to
+// trigger a full Reconcile (zero-cost skip when nothing is marked).
 func (r *WikiRootsRepo) HasNeedsAuthzPush() (bool, error) {
 	var n int
 	if err := r.db.QueryRow(`SELECT COUNT(1) FROM wiki_roots WHERE needs_authz_push = 1`).Scan(&n); err != nil {
@@ -100,8 +102,9 @@ func (r *WikiRootsRepo) HasNeedsAuthzPush() (bool, error) {
 	return n > 0, nil
 }
 
-// ClearAllNeedsAuthzPush 批量清除所有 needs_authz_push 标记,在重试循环里的
-// 全量 Reconcile 成功后调用——一次性纠正当前全部待推行,而不是逐条清除。
+// ClearAllNeedsAuthzPush bulk-clears every needs_authz_push marker; called
+// after a successful full Reconcile in the retry loop — corrects all
+// currently pending rows at once, instead of clearing them one by one.
 func (r *WikiRootsRepo) ClearAllNeedsAuthzPush() error {
 	_, err := r.db.Exec(`UPDATE wiki_roots SET needs_authz_push = 0 WHERE needs_authz_push = 1`)
 	return err
