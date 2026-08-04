@@ -6,6 +6,10 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Manually runnable. Without this there is no way to re-run CI for a branch
+  # you cannot push to — re-running a completed run is not always offered, and
+  # the only other option is asking the author to push again.
+  workflow_dispatch:
 
 # Read-only: nothing here publishes anything. A token that cannot write is one
 # that cannot be misused by a compromised dependency.
