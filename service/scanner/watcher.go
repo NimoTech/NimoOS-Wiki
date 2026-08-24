@@ -68,6 +68,13 @@ type Watcher struct {
 	// SyncOut is read by the EventProcessor for user-notes reverse-sync tasks.
 	SyncOut chan UserNotesSyncTask
 
+	// pendingSync buffers UserNotesSyncTasks that could not be delivered
+	// because SyncOut was full. Keyed by NodePath so repeated external edits
+	// to the same node collapse to the latest task. Retried from Run on a
+	// ticker; bounded naturally by the number of wiki nodes (= roots).
+	pendingMu   sync.Mutex
+	pendingSync map[string]UserNotesSyncTask
+
 	// OnWatchLimit is invoked (if non-nil) when a runtime fsw.Add hits the
 	// inotify watch-limit while handling a Create event for rootID. Callers
 	// should degrade the root to scan_only; the callback must be idempotent
@@ -80,13 +87,14 @@ func NewWatcher(events *repo.FileEventsRepo, nodes *repo.WikiNodesRepo, ig *igno
 		log = zap.NewNop()
 	}
 	return &Watcher{
-		events:  events,
-		nodes:   nodes,
-		ig:      ig,
-		log:     log,
-		roots:   map[string]string{},
-		Guard:   guard,
-		SyncOut: make(chan UserNotesSyncTask, 64),
+		events:      events,
+		nodes:       nodes,
+		ig:          ig,
+		log:         log,
+		roots:       map[string]string{},
+		Guard:       guard,
+		SyncOut:     make(chan UserNotesSyncTask, 64),
+		pendingSync: map[string]UserNotesSyncTask{},
 	}
 }
 
@@ -171,6 +179,8 @@ func (w *Watcher) Run(ctx context.Context) {
 		return
 	}
 	defer w.fsw.Close()
+	retry := time.NewTicker(10 * time.Second)
+	defer retry.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -185,6 +195,8 @@ func (w *Watcher) Run(ctx context.Context) {
 				return
 			}
 			w.log.Warn("fsnotify error", zap.Error(err))
+		case <-retry.C:
+			w.retryPendingSync()
 		}
 	}
 }
@@ -291,11 +303,7 @@ func (w *Watcher) handleWikiFile(rootID string, ev fsnotify.Event) {
 		return
 	}
 
-	select {
-	case w.SyncOut <- UserNotesSyncTask{RootID: rootID, WikiMDPath: wikiMDPath, NodePath: nodePath}:
-	default:
-		w.log.Warn("user-notes sync queue full; dropping task", zap.String("path", nodePath))
-	}
+	w.sendSync(UserNotesSyncTask{RootID: rootID, WikiMDPath: wikiMDPath, NodePath: nodePath})
 }
 
 func (w *Watcher) insertEvent(rootID, p, op string, isDir bool) {
@@ -372,4 +380,34 @@ func (w *Watcher) backfillNewDir(rootID, dir string) {
 		w.insertEvent(rootID, p, "create", d.IsDir())
 		return nil
 	})
+}
+
+// sendSync delivers a reverse-sync task, buffering it when SyncOut is full
+// instead of dropping it (external edits must eventually reach the DB).
+func (w *Watcher) sendSync(t UserNotesSyncTask) {
+	select {
+	case w.SyncOut <- t:
+	default:
+		w.pendingMu.Lock()
+		w.pendingSync[t.NodePath] = t
+		w.pendingMu.Unlock()
+		w.log.Warn("user-notes sync queue full; task buffered for retry",
+			zap.String("path", t.NodePath))
+	}
+}
+
+// retryPendingSync re-attempts buffered tasks without blocking. Tasks that
+// still don't fit stay buffered for the next tick.
+func (w *Watcher) retryPendingSync() {
+	w.pendingMu.Lock()
+	defer w.pendingMu.Unlock()
+	for k, t := range w.pendingSync {
+		select {
+		case w.SyncOut <- t:
+			delete(w.pendingSync, k)
+			w.log.Debug("buffered user-notes sync delivered", zap.String("path", k))
+		default:
+			return // channel full again; keep the rest
+		}
+	}
 }
