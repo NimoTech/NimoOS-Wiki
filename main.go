@@ -124,6 +124,9 @@ func main() {
 	}
 	wri := writer.NewWriter(rNodes, rFiles, rEvents, bus, locks, rSummaries,
 		time.Duration(config.Cfg.WikiWriteDebounceSec)*time.Second, zapLog)
+	// A flush ENOENT whose node dir is gone means the root path vanished —
+	// disable the root instead of retrying forever.
+	wri.SetOnRootGone(func(rootID string) { mgr.DisableForMissingPath(rootID) })
 
 	// Boot user-notes sync: pull in any .wiki.md edits the user made while the
 	// service was stopped. Must run BEFORE watchers are registered so the live
