@@ -83,7 +83,37 @@ func (c *Client) Reconcile(ctx context.Context, grants []Grant) error {
 	return c.do(ctx, http.MethodPost, url, body)
 }
 
-// do is the request-sending logic shared by all three methods: short
+// EnabledRoots asks core which root_ids are currently granted (enabled), via
+// GET {base}/v1/nimoos/search-roots — the very list NimoOS-Search scopes
+// queries with. The retry loop compares it against wiki's own roots to detect
+// drift that no needs_authz_push marker will ever report (core rewritten by
+// someone else, e.g. an isolated test wiki's boot reconcile, 2026-08-24).
+func (c *Client) EnabledRoots(ctx context.Context) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	url := resolveBaseURL(c.discoveryFile) + "/v1/nimoos/search-roots"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("rootsync: failed to build request: %w", err)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("rootsync: request to core failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("rootsync: core returned non-success status code %d", resp.StatusCode)
+	}
+	var out struct {
+		RootIDs []string `json:"root_ids"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("rootsync: decode search-roots: %w", err)
+	}
+	return out.RootIDs, nil
+}
+
+// do is the request-sending logic shared by the write methods: short
 // timeout, JSON-encoded request body, and any non-2xx status code is
 // converted to an error (response body details aren't parsed — the caller
 // only cares about success/failure).
