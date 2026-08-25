@@ -105,7 +105,7 @@ func main() {
 	// root lifecycle change (create/delete/enable/disable) must be pushed to
 	// core incrementally; discoveryFile is the service-discovery file core
 	// writes at startup, recording its current listen address.
-	rsClient := rootsync.New("/var/run/nimoos/nimoos.url")
+	rsClient := rootsync.New(filepath.Join(config.Cfg.RuntimePath, external.NimoOSURLFilename))
 	mgr.SetPusher(rsClient)
 	mgr.SetLogger(zapLog)
 	rec := scanner.NewReconciler(rFiles, rEvents, ig)
