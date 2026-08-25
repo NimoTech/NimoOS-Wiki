@@ -117,3 +117,34 @@ func TestMissingDiscoveryFile_FallsBackToDefault(t *testing.T) {
 		t.Fatal("expected error since fallback address is not a real server, but got nil")
 	}
 }
+
+func TestEnabledRoots_ParsesRootIDs(t *testing.T) {
+	var gotMethod, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		w.Write([]byte(`{"root_ids":["photos","r1"]}`))
+	}))
+	defer srv.Close()
+	c := rootsync.New(writeURLFile(t, srv.URL))
+	ids, err := c.EnabledRoots(context.Background())
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if gotMethod != http.MethodGet || gotPath != "/v1/nimoos/search-roots" {
+		t.Fatalf("method=%s path=%s", gotMethod, gotPath)
+	}
+	if len(ids) != 2 || ids[0] != "photos" || ids[1] != "r1" {
+		t.Fatalf("ids=%v", ids)
+	}
+}
+
+func TestEnabledRoots_NonOKIsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	c := rootsync.New(writeURLFile(t, srv.URL))
+	if _, err := c.EnabledRoots(context.Background()); err == nil {
+		t.Fatal("expected error on 500")
+	}
+}

@@ -105,7 +105,7 @@ func main() {
 	// root lifecycle change (create/delete/enable/disable) must be pushed to
 	// core incrementally; discoveryFile is the service-discovery file core
 	// writes at startup, recording its current listen address.
-	rsClient := rootsync.New("/var/run/nimoos/nimoos.url")
+	rsClient := rootsync.New(filepath.Join(config.Cfg.RuntimePath, external.NimoOSURLFilename))
 	mgr.SetPusher(rsClient)
 	mgr.SetLogger(zapLog)
 	rec := scanner.NewReconciler(rFiles, rEvents, ig)
@@ -331,6 +331,9 @@ const authzPushRetryInterval = 60 * time.Second
 // naturally satisfies this interface.
 type authzReconciler interface {
 	Reconcile(ctx context.Context, grants []rootsync.Grant) error
+	// EnabledRoots returns core's currently granted root_ids, used by the
+	// quiet-tick drift probe (see authzDriftDetected).
+	EnabledRoots(ctx context.Context) ([]string, error)
 }
 
 // authzDirtyChecker is the minimal read/write surface roots.Manager exposes
@@ -362,6 +365,25 @@ func runAuthzPushRetryLoop(ctx context.Context, r *repo.WikiRootsRepo, rs authzR
 			authzPushRetryTick(ctx, r, rs, mgr, zapLog)
 		}
 	}
+}
+
+// authzDriftDetected reports whether core's granted root_ids disagree with
+// wiki's roots: an enabled wiki root core no longer grants, or a wiki root
+// that is disabled here yet still granted there. Root ids core holds that
+// wiki has never heard of (the virtual "photos" root, other sources) are
+// not drift — only rows wiki owns are judged.
+func authzDriftDetected(wikiRoots []repo.WikiRoot, coreRoots []string) bool {
+	granted := make(map[string]struct{}, len(coreRoots))
+	for _, id := range coreRoots {
+		granted[id] = struct{}{}
+	}
+	for _, root := range wikiRoots {
+		_, ok := granted[root.ID]
+		if root.Enabled != ok {
+			return true
+		}
+	}
+	return false
 }
 
 // authzPushRetryTick is one tick of the retry loop, executed in
@@ -413,17 +435,37 @@ func authzPushRetryTick(ctx context.Context, r *repo.WikiRootsRepo, rs authzReco
 			log.Warn("authz push retry: clear needs_authz_push failed", zap.Error(err))
 		}
 	}
-	if !dirty && !hadFlags {
-		return
-	}
 
 	// Step 2: take a snapshot.
 	all, err := r.List()
 	if err != nil {
 		log.Warn("authz push retry: list roots failed", zap.Error(err))
-		mgr.MarkAuthzDirty()
+		if dirty || hadFlags {
+			mgr.MarkAuthzDirty()
+		}
 		return
 	}
+
+	// Step 2b: quiet tick — no signal of our own. Our markers only ever
+	// record OUR failed pushes; they say nothing about core being rewritten
+	// behind our back (an isolated test wiki's boot reconcile did exactly
+	// that on 2026-08-24 and silently scoped every search down to photos).
+	// So probe core's granted list and treat disagreement as a signal. A
+	// failed probe is not drift: just try again next tick, without raising
+	// the dirty flag (that would turn every core hiccup into a Reconcile).
+	if !dirty && !hadFlags {
+		coreRoots, err := rs.EnabledRoots(ctx)
+		if err != nil {
+			log.Debug("authz drift probe: core unreachable; will retry next tick", zap.Error(err))
+			return
+		}
+		if !authzDriftDetected(all, coreRoots) {
+			return
+		}
+		log.Warn("authz drift detected: core root grants disagree with wiki roots; re-reconciling",
+			zap.Int("wiki_roots", len(all)), zap.Strings("core_roots", coreRoots))
+	}
+
 	grants := make([]rootsync.Grant, 0, len(all))
 	for _, root := range all {
 		grants = append(grants, rootsync.Grant{RootID: root.ID, Path: root.Path, Enabled: root.Enabled})

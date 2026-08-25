@@ -179,11 +179,22 @@ func TestReconcileTickSkipsStormingRoot(t *testing.T) {
 type fakeAuthzReconciler struct {
 	calls       []int // grants length on each call
 	errToReturn error
+	// coreRoots is what the fake core reports as its enabled root_ids
+	// (GET /v1/nimoos/search-roots); coreErr makes that probe fail; probes
+	// counts how often the tick asked.
+	coreRoots []string
+	coreErr   error
+	probes    int
 }
 
 func (f *fakeAuthzReconciler) Reconcile(_ context.Context, grants []rootsync.Grant) error {
 	f.calls = append(f.calls, len(grants))
 	return f.errToReturn
+}
+
+func (f *fakeAuthzReconciler) EnabledRoots(_ context.Context) ([]string, error) {
+	f.probes++
+	return f.coreRoots, f.coreErr
 }
 
 // failingPusher is a test double for roots.Manager's pusher dependency, where
@@ -271,6 +282,8 @@ type windowRaceReconciler struct {
 	calls     int
 }
 
+func (f *windowRaceReconciler) EnabledRoots(_ context.Context) ([]string, error) { return nil, nil }
+
 func (f *windowRaceReconciler) Reconcile(_ context.Context, _ []rootsync.Grant) error {
 	f.calls++
 	_ = f.rRoots.SetNeedsAuthzPush(f.newRootID, true)
@@ -332,4 +345,88 @@ func TestAuthzPushRetryTick_MemoryDirtyFlagTriggersReconcileAndClearsOnSuccess(t
 
 	require.Len(t, fr.calls, 1, "the in-memory dirty flag should also trigger one full Reconcile")
 	require.False(t, mgr.AuthzDirty(), "the in-memory dirty flag should be cleared after a successful Reconcile")
+}
+
+// --- drift self-heal --------------------------------------------------------
+//
+// Core's o_root_grants can be rewritten behind wiki's back (2026-08-24: an
+// isolated test wiki's boot reconcile wiped every production grant, and with
+// no needs_authz_push marker set the retry loop never noticed). Every quiet
+// tick therefore probes core's enabled root list and re-reconciles when it
+// disagrees with wiki's own roots.
+
+func seedAuthzRoot(t *testing.T, rRoots *repo.WikiRootsRepo, id string, enabled bool) {
+	t.Helper()
+	require.NoError(t, rRoots.Insert(repo.WikiRoot{
+		ID: id, Path: "/" + id, Level: "space", WatchMode: "auto",
+		StorageMode: "inline", Enabled: enabled, ScanIntervalS: 600, CreatedAt: time.Now().UnixMilli(),
+	}))
+}
+
+func TestAuthzPushRetryTick_EnabledRootMissingInCoreTriggersReconcile(t *testing.T) {
+	d := openMainTestDB(t)
+	rRoots := repo.NewWikiRoots(d)
+	mgr := roots.NewManager(rRoots, repo.NewWikiNodes(d), repo.NewFileIndex(d), repo.NewFileEvents(d), nil, nil)
+	seedAuthzRoot(t, rRoots, "r1", true)
+	seedAuthzRoot(t, rRoots, "r2", true)
+
+	fr := &fakeAuthzReconciler{coreRoots: []string{"photos", "r1"}} // r2 vanished from core
+	authzPushRetryTick(context.Background(), rRoots, fr, mgr, zap.NewNop())
+
+	require.Len(t, fr.calls, 1, "core disagreeing with wiki must trigger one full Reconcile")
+	require.Equal(t, 2, fr.calls[0], "the reconcile carries every wiki root")
+}
+
+func TestAuthzPushRetryTick_NoReconcileWhenCoreAgrees(t *testing.T) {
+	d := openMainTestDB(t)
+	rRoots := repo.NewWikiRoots(d)
+	mgr := roots.NewManager(rRoots, repo.NewWikiNodes(d), repo.NewFileIndex(d), repo.NewFileEvents(d), nil, nil)
+	seedAuthzRoot(t, rRoots, "r1", true)
+	seedAuthzRoot(t, rRoots, "r2", false)
+
+	// Core may hold roots from other sources (photos): those are not drift.
+	fr := &fakeAuthzReconciler{coreRoots: []string{"photos", "r1"}}
+	authzPushRetryTick(context.Background(), rRoots, fr, mgr, zap.NewNop())
+
+	require.Equal(t, 1, fr.probes, "a quiet tick probes core exactly once")
+	require.Empty(t, fr.calls)
+}
+
+func TestAuthzPushRetryTick_DisabledRootStillEnabledInCoreIsDrift(t *testing.T) {
+	d := openMainTestDB(t)
+	rRoots := repo.NewWikiRoots(d)
+	mgr := roots.NewManager(rRoots, repo.NewWikiNodes(d), repo.NewFileIndex(d), repo.NewFileEvents(d), nil, nil)
+	seedAuthzRoot(t, rRoots, "r1", false)
+
+	fr := &fakeAuthzReconciler{coreRoots: []string{"r1"}}
+	authzPushRetryTick(context.Background(), rRoots, fr, mgr, zap.NewNop())
+
+	require.Len(t, fr.calls, 1, "a root wiki disabled must not stay searchable via core")
+}
+
+func TestAuthzPushRetryTick_ProbeFailureIsQuiet(t *testing.T) {
+	d := openMainTestDB(t)
+	rRoots := repo.NewWikiRoots(d)
+	mgr := roots.NewManager(rRoots, repo.NewWikiNodes(d), repo.NewFileIndex(d), repo.NewFileEvents(d), nil, nil)
+	seedAuthzRoot(t, rRoots, "r1", true)
+
+	fr := &fakeAuthzReconciler{coreErr: fmt.Errorf("core unreachable")}
+	authzPushRetryTick(context.Background(), rRoots, fr, mgr, zap.NewNop())
+
+	require.Empty(t, fr.calls, "an unreachable core is not drift; just try again next tick")
+	require.False(t, mgr.AuthzDirty(), "a failed probe must not raise the dirty flag (that would spam Reconcile)")
+}
+
+func TestAuthzPushRetryTick_PendingSignalSkipsProbe(t *testing.T) {
+	d := openMainTestDB(t)
+	rRoots := repo.NewWikiRoots(d)
+	mgr := roots.NewManager(rRoots, repo.NewWikiNodes(d), repo.NewFileIndex(d), repo.NewFileEvents(d), nil, nil)
+	seedAuthzRoot(t, rRoots, "r1", true)
+	require.NoError(t, rRoots.SetNeedsAuthzPush("r1", true))
+
+	fr := &fakeAuthzReconciler{coreErr: fmt.Errorf("core unreachable")}
+	authzPushRetryTick(context.Background(), rRoots, fr, mgr, zap.NewNop())
+
+	require.Equal(t, 0, fr.probes, "a pending signal already implies a Reconcile; no probe needed")
+	require.Len(t, fr.calls, 1)
 }
