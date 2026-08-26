@@ -105,7 +105,10 @@ func (r *WikiNodesRepo) List(rootID string) ([]WikiNode, error) {
 
 func (r *WikiNodesRepo) ListDirty(limit int) ([]WikiNode, error) {
 	rows, err := r.db.Query(`SELECT `+nodeSelectCols+`
-		FROM wiki_nodes WHERE dirty = 1 ORDER BY updated_at LIMIT ?`, limit)
+		FROM wiki_nodes WHERE dirty = 1
+		AND (root_id IS NULL
+		     OR root_id IN (SELECT id FROM wiki_roots WHERE enabled = 1))
+		ORDER BY updated_at LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}

@@ -39,6 +39,7 @@ type Writer struct {
 	debounceWindow     time.Duration
 	aggregateThreshold int
 	log                *zap.Logger
+	onRootGone         func(rootID string)
 }
 
 // NewWriter constructs a Writer. The `locks` parameter is the shared per-path
@@ -64,6 +65,23 @@ func NewWriter(nodes *repo.WikiNodesRepo, files *repo.FileIndexRepo,
 		summaries: summaries,
 		debounceWindow: debounceWindow, aggregateThreshold: 50, log: log,
 	}
+}
+
+// SetOnRootGone wires the callback fired when a flush hits ENOENT and the
+// node's directory itself is gone (root path vanished). Wired to
+// roots.Manager.DisableForMissingPath in main. Nil = disabled (tests).
+func (w *Writer) SetOnRootGone(fn func(rootID string)) { w.onRootGone = fn }
+
+// maybeRootGone inspects a flush error; if it is ENOENT and the node path
+// no longer exists, the node's root has vanished — tell the roots manager.
+func (w *Writer) maybeRootGone(n repo.WikiNode, err error) {
+	if w.onRootGone == nil || n.RootID == nil || !os.IsNotExist(err) {
+		return
+	}
+	if _, statErr := os.Stat(n.Path); statErr == nil || !os.IsNotExist(statErr) {
+		return
+	}
+	w.onRootGone(*n.RootID)
 }
 
 // FlushOne renders + writes one node's .wiki.md.
@@ -258,6 +276,7 @@ func (w *Writer) Run(ctx context.Context) {
 			for _, n := range dirty {
 				if err := w.FlushOne(n.Path); err != nil {
 					w.log.Warn("flush failed", zap.String("path", n.Path), zap.Error(err))
+					w.maybeRootGone(n, err)
 				}
 			}
 		}

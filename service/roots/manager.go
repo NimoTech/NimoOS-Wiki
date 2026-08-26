@@ -191,6 +191,34 @@ func (m *Manager) DegradeToScanOnly(rootID, reason string) {
 	})
 }
 
+// DisableForMissingPath disables a root whose on-disk path vanished at
+// runtime (drive pulled, directory deleted) so WikiWriter stops retrying
+// ENOENT forever (spec 2026-05-13 §9). wiki_nodes rows and user_notes are
+// kept: re-enabling after the path returns restores everything. Idempotent;
+// re-checks the path so a racing re-create is a no-op.
+func (m *Manager) DisableForMissingPath(rootID string) {
+	root, err := m.roots.Get(rootID)
+	if err != nil || !root.Enabled {
+		return
+	}
+	if _, statErr := os.Stat(root.Path); statErr == nil {
+		return
+	}
+	if err := m.roots.SetEnabled(rootID, false); err != nil {
+		return
+	}
+	if m.watch != nil {
+		m.watch.Unwatch(rootID)
+	}
+	m.bus.Publish(common.EventRootDisabled, map[string]any{
+		"root_id": rootID, "path": root.Path, "level": root.Level,
+		"reason": "path_missing",
+	})
+	m.pushUpsert(rootID, root.Path, false)
+	m.log.Warn("wiki root path missing; root disabled",
+		zap.String("root_id", rootID), zap.String("path", root.Path))
+}
+
 type CreateArgs struct {
 	Path          string
 	Level         string // 'space' | 'project'

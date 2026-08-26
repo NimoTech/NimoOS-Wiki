@@ -438,3 +438,51 @@ func TestCountDirsQuickTimeoutTreatedAsExceeded(t *testing.T) {
 	require.True(t, exceeded)
 	require.Less(t, n, 1_000_000)
 }
+
+func TestDisableForMissingPath(t *testing.T) {
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	bus := &fakeBus{}
+	rootsRepo := repo.NewWikiRoots(d)
+	nodesRepo := repo.NewWikiNodes(d)
+	m := NewManager(rootsRepo, nodesRepo, nil, nil, bus, nil)
+	fw := &fakeWatch{}
+	m.SetWatch(fw)
+
+	tmp := t.TempDir()
+	id, _, err := m.Create(CreateArgs{Path: tmp, Level: "space"})
+	require.NoError(t, err)
+
+	// Path still exists -> no-op.
+	m.DisableForMissingPath(id)
+	r, err := rootsRepo.Get(id)
+	require.NoError(t, err)
+	require.True(t, r.Enabled)
+
+	// Dirty node + path gone -> disabled, unwatch, event, ListDirty empty.
+	require.NoError(t, nodesRepo.SetDirty(tmp, true))
+	dirty, err := nodesRepo.ListDirty(50)
+	require.NoError(t, err)
+	require.Len(t, dirty, 1)
+
+	require.NoError(t, os.RemoveAll(tmp))
+	m.DisableForMissingPath(id)
+
+	r, err = rootsRepo.Get(id)
+	require.NoError(t, err)
+	require.False(t, r.Enabled)
+	require.Contains(t, fw.unwatched, id)
+	require.Equal(t, 1, bus.countOf(common.EventRootDisabled))
+	payload, ok := bus.lastPayload(common.EventRootDisabled).(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "path_missing", payload["reason"])
+
+	dirty, err = nodesRepo.ListDirty(50)
+	require.NoError(t, err)
+	require.Empty(t, dirty, "dirty nodes of disabled roots must not be flushed")
+
+	// Idempotent.
+	m.DisableForMissingPath(id)
+	require.Equal(t, 1, bus.countOf(common.EventRootDisabled))
+}
