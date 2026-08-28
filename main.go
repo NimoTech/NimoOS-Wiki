@@ -618,13 +618,14 @@ func archiveSweep(ev *repo.FileEventsRepo, roots *repo.WikiRootsRepo,
 		return
 	}
 	purged, err := ev.PurgeOldestOverCap(maxRows)
-	if err != nil {
-		log.Warn("row-cap purge", zap.Error(err))
-		return
-	}
+	// Batches commit independently, so a mid-way error still means rows are
+	// gone: mark roots whenever anything was purged, THEN report the error.
 	if purged > 0 {
 		log.Warn("file_events over row cap: purged oldest", zap.Int64("purged", purged))
 		markAllEnabledNeedsReconcile(roots)
+	}
+	if err != nil {
+		log.Warn("row-cap purge", zap.Error(err))
 	}
 }
 

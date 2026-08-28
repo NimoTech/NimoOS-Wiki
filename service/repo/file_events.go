@@ -248,7 +248,10 @@ func (r *FileEventsRepo) execBatches(stmt string, args ...interface{}) (int64, e
 		if err != nil {
 			return total, err
 		}
-		n, _ := res.RowsAffected()
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, err
+		}
 		total += n
 		if n < purgeBatch {
 			return total, nil
