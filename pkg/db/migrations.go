@@ -5,6 +5,25 @@ import (
 	"fmt"
 )
 
+// file_events DDL lives in named constants so first-boot migrations and the
+// bloated-table fast path (RecreateFileEvents) cannot drift apart.
+const (
+	fileEventsDDL = `CREATE TABLE IF NOT EXISTS file_events (
+		id TEXT PRIMARY KEY,
+		root_id TEXT NOT NULL,
+		path TEXT NOT NULL,
+		op TEXT NOT NULL,
+		rename_to TEXT,
+		is_dir INTEGER NOT NULL DEFAULT 0,
+		detected_at INTEGER NOT NULL,
+		processed_at INTEGER,
+		archived INTEGER NOT NULL DEFAULT 0
+	)`
+	fileEventsIdxUnprocessed = `CREATE INDEX IF NOT EXISTS idx_file_events_unprocessed ON file_events(detected_at) WHERE processed_at IS NULL`
+	fileEventsIdxArchiveQ    = `CREATE INDEX IF NOT EXISTS idx_file_events_archive_q ON file_events(root_id, detected_at) WHERE archived = 0`
+	fileEventsIdxBacklog     = `CREATE INDEX IF NOT EXISTS idx_file_events_backlog ON file_events(root_id) WHERE processed_at IS NULL`
+)
+
 var migrations = []string{
 	`CREATE TABLE IF NOT EXISTS wiki_roots (
 		id TEXT PRIMARY KEY,
@@ -51,19 +70,10 @@ var migrations = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_file_index_parent ON file_index(root_id, parent)`,
 	`CREATE INDEX IF NOT EXISTS idx_file_index_path_prefix ON file_index(root_id, path)`,
-	`CREATE TABLE IF NOT EXISTS file_events (
-		id TEXT PRIMARY KEY,
-		root_id TEXT NOT NULL,
-		path TEXT NOT NULL,
-		op TEXT NOT NULL,
-		rename_to TEXT,
-		is_dir INTEGER NOT NULL DEFAULT 0,
-		detected_at INTEGER NOT NULL,
-		processed_at INTEGER,
-		archived INTEGER NOT NULL DEFAULT 0
-	)`,
-	`CREATE INDEX IF NOT EXISTS idx_file_events_unprocessed ON file_events(detected_at) WHERE processed_at IS NULL`,
-	`CREATE INDEX IF NOT EXISTS idx_file_events_archive_q ON file_events(root_id, detected_at) WHERE archived = 0`,
+	fileEventsDDL,
+	fileEventsIdxUnprocessed,
+	fileEventsIdxArchiveQ,
+	// fileEventsIdxBacklog is deliberately NOT here — see EnsureBacklogIndex.
 	`CREATE TABLE IF NOT EXISTS parse_status (
 		id TEXT PRIMARY KEY,
 		path TEXT UNIQUE NOT NULL,
@@ -141,4 +151,40 @@ func runMigrations(d *sql.DB) error {
 		return fmt.Errorf("add wiki_roots.needs_authz_push: %w", err)
 	}
 	return nil
+}
+
+// EnsureBacklogIndex builds idx_file_events_backlog. It is deliberately NOT part
+// of runMigrations: on a bloated table the build takes minutes and gigabytes of
+// WAL, so it must run only after startupSweep has trimmed or rebuilt the table.
+// The only consumer (CountUnprocessedByRoot) runs in loops that start after it.
+func EnsureBacklogIndex(d *sql.DB) error {
+	_, err := d.Exec(fileEventsIdxBacklog)
+	return err
+}
+
+// RecreateFileEvents drops and recreates file_events with its indexes in one
+// transaction — the bloated-table fast path (spec §3.4). The table is derived
+// data, and marks every enabled root needs_reconcile in the same transaction,
+// so a crash between DROP and mark cannot lose the reconcile signal.
+func RecreateFileEvents(d *sql.DB) error {
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	stmts := []string{`DROP TABLE IF EXISTS file_events`, fileEventsDDL,
+		fileEventsIdxUnprocessed, fileEventsIdxArchiveQ, fileEventsIdxBacklog,
+		// Same transaction as the DROP: a crash in between must not lose the
+		// reconcile signal for the rows this just destroyed.
+		`UPDATE wiki_roots SET needs_reconcile = 1 WHERE enabled = 1`}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			_ = tx.Rollback()
+			head := stmt
+			if len(head) > 60 {
+				head = head[:60]
+			}
+			return fmt.Errorf("recreate file_events (%s): %w", head, err)
+		}
+	}
+	return tx.Commit()
 }

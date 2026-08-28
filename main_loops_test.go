@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -429,4 +431,171 @@ func TestAuthzPushRetryTick_PendingSignalSkipsProbe(t *testing.T) {
 
 	require.Equal(t, 0, fr.probes, "a pending signal already implies a Reconcile; no probe needed")
 	require.Len(t, fr.calls, 1)
+}
+
+func insertEvents(t *testing.T, ev *repo.FileEventsRepo, n int) {
+	t.Helper()
+	now := time.Now().UnixMilli()
+	for i := 0; i < n; i++ {
+		require.NoError(t, ev.Insert(repo.FileEvent{
+			ID: repo.NewID(), RootID: "rootA", Path: fmt.Sprintf("/p/%d", i),
+			Op: "create", DetectedAt: now + int64(i),
+		}))
+	}
+}
+
+func insertRoot(t *testing.T, roots *repo.WikiRootsRepo, id string) {
+	t.Helper()
+	require.NoError(t, roots.Insert(repo.WikiRoot{
+		ID: id, Path: "/" + id, Level: "space", WatchMode: "auto",
+		StorageMode: "inline", Enabled: true, ScanIntervalS: 600, CreatedAt: time.Now().UnixMilli(),
+	}))
+}
+
+// openMainFileDB opens a real on-disk db: the fast-path tests assert that
+// VACUUM actually reclaimed space, which is meaningless for ":memory:".
+func openMainFileDB(t *testing.T) (*sql.DB, string) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "wiki.db")
+	d, err := db.Open(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	return d, dbPath
+}
+
+// seedBloatedEvents inserts n padded rows so file_events occupies enough pages
+// for a VACUUM to be measurable, then checkpoints the WAL so those pages are in
+// the main db file — otherwise fileSize(dbPath) would say almost nothing.
+func seedBloatedEvents(t *testing.T, d *sql.DB, n int) {
+	t.Helper()
+	pad := strings.Repeat("x", 400)
+	now := time.Now().UnixMilli()
+	tx, err := d.Begin()
+	require.NoError(t, err)
+	stmt, err := tx.Prepare(`INSERT INTO file_events
+		(id, root_id, path, op, is_dir, detected_at, archived) VALUES (?,?,?,?,0,?,0)`)
+	require.NoError(t, err)
+	for i := 0; i < n; i++ {
+		_, err := stmt.Exec(repo.NewID(), "rootA", fmt.Sprintf("/p/%d/%s", i, pad), "create", now+int64(i))
+		require.NoError(t, err)
+	}
+	require.NoError(t, stmt.Close())
+	require.NoError(t, tx.Commit())
+	_, err = d.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	require.NoError(t, err)
+}
+
+func TestStartupSweep_RegularPathTrimsToCap(t *testing.T) {
+	d := openMainTestDB(t)
+	ev := repo.NewFileEvents(d)
+	roots := repo.NewWikiRoots(d)
+	insertRoot(t, roots, "rootA")
+	insertEvents(t, ev, 10)
+
+	// 10 rows, cap 6: 10 <= 10*6 so the regular path (archiveSweep) runs.
+	startupSweep(ev, roots, d, ":memory:", 90, 6,
+		func(string) (uint64, error) { return 1 << 40, nil }, zap.NewNop())
+
+	total, err := ev.CountAll()
+	require.NoError(t, err)
+	require.EqualValues(t, 6, total)
+	g, err := roots.Get("rootA")
+	require.NoError(t, err)
+	require.True(t, g.NeedsReconcile)
+}
+
+func TestStartupSweep_BloatedFastPathRecreatesTable(t *testing.T) {
+	d, dbPath := openMainFileDB(t)
+	ev := repo.NewFileEvents(d)
+	roots := repo.NewWikiRoots(d)
+	insertRoot(t, roots, "rootA")
+	insertRoot(t, roots, "rootB")
+	seedBloatedEvents(t, d, 2000) // > 10 * cap(10) → DROP + recreate
+	before := fileSize(dbPath)
+	require.Greater(t, before, int64(500_000), "seed should have grown the db file")
+
+	probed := false
+	startupSweep(ev, roots, d, dbPath, 90, 10,
+		func(string) (uint64, error) { probed = true; return 1 << 40, nil }, zap.NewNop())
+
+	total, err := ev.CountAll()
+	require.NoError(t, err)
+	require.Zero(t, total, "fast path empties the table instead of batch-deleting")
+	require.True(t, probed, "free-space probe (and thus VACUUM) must run on the fast path")
+	require.Less(t, fileSize(dbPath), before,
+		"VACUUM + wal_checkpoint(TRUNCATE) must actually give the space back")
+	for _, id := range []string{"rootA", "rootB"} {
+		g, err := roots.Get(id)
+		require.NoError(t, err)
+		require.True(t, g.NeedsReconcile, id)
+	}
+	// Table is usable again right away.
+	require.NoError(t, ev.Insert(repo.FileEvent{ID: repo.NewID(), RootID: "rootA", Path: "/x", Op: "create", DetectedAt: 1}))
+}
+
+func TestStartupSweep_FastPathSkipsVacuumOnProbeError(t *testing.T) {
+	d, dbPath := openMainFileDB(t)
+	ev := repo.NewFileEvents(d)
+	roots := repo.NewWikiRoots(d)
+	insertRoot(t, roots, "rootA")
+	seedBloatedEvents(t, d, 2000)
+	before := fileSize(dbPath)
+
+	// avail probe errors → VACUUM skipped, but recreate still happened.
+	startupSweep(ev, roots, d, dbPath, 90, 10,
+		func(string) (uint64, error) { return 0, fmt.Errorf("statfs: boom") }, zap.NewNop())
+
+	total, err := ev.CountAll()
+	require.NoError(t, err)
+	require.Zero(t, total)
+	require.GreaterOrEqual(t, fileSize(dbPath), before, "no VACUUM → no space returned")
+}
+
+func TestStartupSweep_FastPathSkipsVacuumWhenLowDisk(t *testing.T) {
+	d, dbPath := openMainFileDB(t)
+	ev := repo.NewFileEvents(d)
+	roots := repo.NewWikiRoots(d)
+	insertRoot(t, roots, "rootA")
+	seedBloatedEvents(t, d, 2000)
+	before := fileSize(dbPath)
+
+	// Numeric arm: probe succeeds but there is no free space at all.
+	startupSweep(ev, roots, d, dbPath, 90, 10,
+		func(string) (uint64, error) { return 0, nil }, zap.NewNop())
+
+	total, err := ev.CountAll()
+	require.NoError(t, err)
+	require.Zero(t, total, "the table is still recreated")
+	require.GreaterOrEqual(t, fileSize(dbPath), before, "no VACUUM → no space returned")
+}
+
+// TestStartupHeartbeatStopsPromptly guards the only failure mode that matters
+// outside systemd: stop() must not wait for the 20s ticker (SdNotify itself is
+// a no-op when NOTIFY_SOCKET is unset).
+func TestStartupHeartbeatStopsPromptly(t *testing.T) {
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		startupHeartbeat(zap.NewNop())()
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("startupHeartbeat stop() did not return promptly")
+	}
+}
+
+func TestStartupSweep_CapDisabledIsNoop(t *testing.T) {
+	d := openMainTestDB(t)
+	ev := repo.NewFileEvents(d)
+	roots := repo.NewWikiRoots(d)
+	insertRoot(t, roots, "rootA")
+	insertEvents(t, ev, 50)
+
+	startupSweep(ev, roots, d, ":memory:", 90, 0,
+		func(string) (uint64, error) { return 1 << 40, nil }, zap.NewNop())
+
+	total, err := ev.CountAll()
+	require.NoError(t, err)
+	require.EqualValues(t, 50, total)
 }

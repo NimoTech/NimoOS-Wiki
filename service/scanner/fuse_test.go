@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sort"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func upd(g *StormGuard, b map[string]int) (in, out []string) {
@@ -167,6 +169,12 @@ func TestGlobalFuseReleasesWhenDrained(t *testing.T) {
 	if len(out) == 0 || g.IsStorming("a") || g.IsStorming("b") {
 		t.Fatalf("global release failed: %v", out)
 	}
+}
+
+func TestStormGuard_CountLimit(t *testing.T) {
+	require.Equal(t, 40, NewStormGuard(20, 5, 10, 2).CountLimit())
+	require.Equal(t, 60, NewStormGuard(10, 5, 30, 2).CountLimit())
+	require.Equal(t, 1, NewStormGuard(0, 0, 0, 0).CountLimit())
 }
 
 func TestRootAbsentFromBacklogExits(t *testing.T) {

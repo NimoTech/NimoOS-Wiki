@@ -80,6 +80,13 @@ type Watcher struct {
 	// should degrade the root to scan_only; the callback must be idempotent
 	// since it may fire more than once for the same root.
 	OnWatchLimit func(rootID string)
+
+	// ExcludePrefixes are absolute, Clean'd directories whose subtree is never
+	// watched and whose events are always dropped (spec §3.5) — e.g. the
+	// wiki's own DataPath, so writes to wiki.db-wal cannot feed back into
+	// file_events even when DataPath physically lives under a root
+	// (/DATA/.system_data/nimoos/wiki on stock installs). Set before Watch.
+	ExcludePrefixes []string
 }
 
 func NewWatcher(events *repo.FileEventsRepo, nodes *repo.WikiNodesRepo, ig *ignore.Matcher, guard *StormGuard, log *zap.Logger) *Watcher {
@@ -125,7 +132,7 @@ func (w *Watcher) Watch(rootID, rootPath string) error {
 		if !d.IsDir() {
 			return nil
 		}
-		if p != rootPath && w.ig.IsContainerDir(filepath.Base(p)) {
+		if p != rootPath && (w.ig.IsContainerDir(filepath.Base(p)) || w.isExcluded(p)) {
 			return filepath.SkipDir
 		}
 		if err := w.fsw.Add(p); err != nil {
@@ -209,8 +216,16 @@ func (w *Watcher) handle(ev fsnotify.Event) {
 		return
 	}
 
+	// PATH 1b: never record anything under an excluded prefix (own DataPath)
+	// or below a container dir — even if a stale kernel watch delivers it.
+	if w.isExcluded(ev.Name) {
+		return
+	}
 	rootID := w.rootIDFor(ev.Name)
 	if rootID == "" {
+		return
+	}
+	if hasContainerAncestor(w.ig, w.rootPathFor(rootID), ev.Name) {
 		return
 	}
 
@@ -341,6 +356,21 @@ func (w *Watcher) rootIDFor(p string) string {
 	return ""
 }
 
+func (w *Watcher) isExcluded(p string) bool {
+	for _, ex := range w.ExcludePrefixes {
+		if p == ex || strings.HasPrefix(p, ex+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *Watcher) rootPathFor(rootID string) string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.roots[rootID]
+}
+
 func (w *Watcher) parentIsContainer(p string) bool {
 	parent := filepath.Dir(p)
 	return w.ig.IsContainerDir(filepath.Base(parent))
@@ -359,6 +389,12 @@ func (w *Watcher) backfillNewDir(rootID, dir string) {
 		}
 		if p == dir {
 			return nil // already handled by caller
+		}
+		if w.isExcluded(p) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		base := filepath.Base(p)
 		if w.ig.IsSystemIgnoredBasename(base) || w.ig.IsWikiFile(base) || w.ig.IsWikiTmpFile(base) {
@@ -410,4 +446,20 @@ func (w *Watcher) retryPendingSync() {
 			return // channel full again; keep the rest
 		}
 	}
+}
+
+// hasContainerAncestor reports whether any path segment strictly between
+// rootPath and p is a container dir per the matcher. Paths outside rootPath
+// never match (Rel yields ".."; ".." is not a container dir).
+func hasContainerAncestor(ig *ignore.Matcher, rootPath, p string) bool {
+	rel, err := filepath.Rel(rootPath, filepath.Dir(p))
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return false
+	}
+	for _, seg := range strings.Split(rel, string(filepath.Separator)) {
+		if ig.IsContainerDir(seg) {
+			return true
+		}
+	}
+	return false
 }

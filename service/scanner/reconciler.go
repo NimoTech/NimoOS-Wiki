@@ -197,16 +197,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, rootID, rootPath string) err
 // rootPath and p is a container dir per the matcher — the streaming
 // equivalent of the old walk-collected opaqueDirs silent-purge check.
 func (r *Reconciler) hasContainerAncestor(rootPath, p string) bool {
-	rel, err := filepath.Rel(rootPath, filepath.Dir(p))
-	if err != nil || rel == "." {
-		return false
-	}
-	for _, seg := range strings.Split(rel, string(filepath.Separator)) {
-		if r.ig.IsContainerDir(seg) {
-			return true
-		}
-	}
-	return false
+	return hasContainerAncestor(r.ig, rootPath, p)
 }
 
 // Run periodically reconciles a single Root until ctx is cancelled.
