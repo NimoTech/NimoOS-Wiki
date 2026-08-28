@@ -83,7 +83,8 @@ func main() {
 	defer func() { _ = zapLog.Sync() }()
 
 	// DB
-	d, err := db.Open(filepath.Join(config.Cfg.DataPath, "wiki.db"))
+	dbPath := filepath.Join(config.Cfg.DataPath, "wiki.db")
+	d, err := db.Open(dbPath)
 	if err != nil {
 		logger.Error("open db", zap.Error(err))
 		os.Exit(1)
@@ -97,6 +98,12 @@ func main() {
 	rEvents := repo.NewFileEvents(d)
 	rParse := repo.NewParseStatus(d)
 	rSummaries := repo.NewWikiSummaries(d)
+
+	// Trim / rebuild file_events BEFORE any loop issues its first query
+	// (spec §3.4). Synchronous on purpose: a bloated table must never meet
+	// the once-per-second fuse tick.
+	startupSweep(rEvents, rRoots, d, dbPath, config.Cfg.RecentChangesRetentionDays,
+		config.Cfg.EventMaxRows, diskAvail, zapLog)
 
 	// Services
 	bus := eventbus.New(config.Cfg.RuntimePath)
@@ -119,6 +126,13 @@ func main() {
 	rec.ThrottleEvery = config.Cfg.WalkThrottleEvery
 	rec.ThrottleSleep = time.Duration(config.Cfg.WalkThrottleSleepMs) * time.Millisecond
 	wch := scanner.NewWatcher(rEvents, rNodes, ig, guard, zapLog)
+	// Never watch or record our own data dir (spec §3.5). Resolve symlinks so
+	// a bind-mounted /var/lib/nimoos/wiki matches its /DATA/.system_data path.
+	if real, err := filepath.EvalSymlinks(config.Cfg.DataPath); err == nil {
+		wch.ExcludePrefixes = []string{filepath.Clean(real)}
+	} else {
+		wch.ExcludePrefixes = []string{filepath.Clean(config.Cfg.DataPath)}
+	}
 	mgr.SetWatch(wch)
 	// Runtime watch-limit hits (new dirs created after startup) degrade the
 	// root the same way a registration-time hit below does.

@@ -150,6 +150,8 @@ In other words: Wiki grows one wiki_node for every Root the user registers — i
 3. The cascading UPDATE for a directory rename synchronously updates `file_index`, `wiki_nodes`, and unprocessed `file_events` within a **single transaction**.
 4. WikiWriter's flush order: write to tmp → `os.Chtimes(tmp, T, T)` → **DB commit `last_flushed_mtime = T`** → atomic rename. The DB commit must happen before the rename; otherwise an fsnotify event could arrive first, the Watcher would read the old mtime, misclassify it as an external edit, and trigger a pointless reverse sync.
 
+**Memory safety (2026-08-28):** all `file_events` maintenance is index-backed and batched (50k rows/statement): backlog counts are saturated per root (`CountUnprocessedByRoot(ids, limit)`), the row cap purges by `rowid`, and `temp_store` stays on disk. At startup `startupSweep` runs synchronously before any loop; a table above `10 × EventMaxRows` is dropped and recreated (`db.RecreateFileEvents`) with every root marked `needs_reconcile`, then `VACUUM`ed when ≥1.2× the db size is free. The watcher never watches or records its own `DataPath` or anything below a container dir (`.system_data`, `node_modules`, …), even via stale kernel watches. Post-mortem: `nimo_os_docs/docs/superpowers/specs/2026-08-28-wiki-file-events-memory-safety-design.md`.
+
 ---
 
 ## Data storage and runtime
