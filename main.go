@@ -35,6 +35,11 @@ import (
 	"go.uber.org/zap"
 )
 
+// DefaultBacklogCountLimit bounds CountUnprocessedByRoot when no StormGuard is
+// configured (tests / fuse disabled). Large enough to rank roots by backlog,
+// small enough to stay O(limit) on a bloated table.
+const DefaultBacklogCountLimit = 200000
+
 var (
 	commit = "private build"
 	date   = "private build"
@@ -498,6 +503,21 @@ func listEnabled(r *repo.WikiRootsRepo) []repo.WikiRoot {
 	return out
 }
 
+func rootIDs(roots []repo.WikiRoot) []string {
+	out := make([]string, 0, len(roots))
+	for _, r := range roots {
+		out = append(out, r.ID)
+	}
+	return out
+}
+
+func backlogLimit(guard *scanner.StormGuard) int {
+	if guard == nil {
+		return DefaultBacklogCountLimit
+	}
+	return guard.CountLimit()
+}
+
 // runReconcilerLoop polls every 30 seconds and calls reconcileTick: at most
 // one needs_reconcile root is drained first (largest backlog, spec §4.2
 // staggering), then regular interval-due reconciles run.
@@ -524,7 +544,7 @@ func reconcileTick(ctx context.Context, r *repo.WikiRootsRepo, rec *scanner.Reco
 	guard *scanner.StormGuard, ev *repo.FileEventsRepo, log *zap.Logger) {
 	now := time.Now().UnixMilli()
 	enabled := listEnabled(r)
-	backlogs, _ := ev.CountUnprocessedByRoot()
+	backlogs, _ := ev.CountUnprocessedByRoot(rootIDs(enabled), backlogLimit(guard))
 
 	// 1) one needs_reconcile root per tick
 	var pick *repo.WikiRoot

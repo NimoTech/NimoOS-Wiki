@@ -32,6 +32,20 @@ func (g *StormGuard) IsStorming(rootID string) bool {
 	return g.perRoot[rootID] || g.globalSel[rootID]
 }
 
+// CountLimit is the saturation bound callers pass to
+// FileEventsRepo.CountUnprocessedByRoot: twice the highest fuse threshold is
+// enough to decide every hysteresis edge without counting the whole table.
+func (g *StormGuard) CountLimit() int {
+	m := g.perHigh
+	if g.globalHigh > m {
+		m = g.globalHigh
+	}
+	if m <= 0 {
+		return 1
+	}
+	return 2 * m
+}
+
 // Update advances the storm state from fresh backlog counts and returns the
 // roots that entered / exited storm mode in this step. Roots absent from
 // backlogs are treated as backlog 0.

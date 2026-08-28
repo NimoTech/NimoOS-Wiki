@@ -330,10 +330,21 @@ func (p *EventProcessor) debounce(in []repo.FileEvent, windowMs int64) []repo.Fi
 // updateFuse feeds fresh backlog counts into the storm guard and persists /
 // publishes transitions. Called once per Run tick (spec §4.1). Nil guard = no-op.
 func (p *EventProcessor) updateFuse() {
-	if p.Guard == nil {
+	if p.Guard == nil || p.roots == nil {
 		return
 	}
-	backlogs, err := p.events.CountUnprocessedByRoot()
+	all, err := p.roots.List()
+	if err != nil {
+		p.log.Warn("fuse roots list", zap.Error(err))
+		return
+	}
+	ids := make([]string, 0, len(all))
+	for _, r := range all {
+		if r.Enabled {
+			ids = append(ids, r.ID)
+		}
+	}
+	backlogs, err := p.events.CountUnprocessedByRoot(ids, p.Guard.CountLimit())
 	if err != nil {
 		p.log.Warn("fuse backlog count", zap.Error(err))
 		return

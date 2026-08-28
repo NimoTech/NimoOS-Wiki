@@ -64,6 +64,7 @@ var migrations = []string{
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_file_events_unprocessed ON file_events(detected_at) WHERE processed_at IS NULL`,
 	`CREATE INDEX IF NOT EXISTS idx_file_events_archive_q ON file_events(root_id, detected_at) WHERE archived = 0`,
+	`CREATE INDEX IF NOT EXISTS idx_file_events_backlog ON file_events(root_id) WHERE processed_at IS NULL`,
 	`CREATE TABLE IF NOT EXISTS parse_status (
 		id TEXT PRIMARY KEY,
 		path TEXT UNIQUE NOT NULL,

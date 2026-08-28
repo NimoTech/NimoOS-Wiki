@@ -250,23 +250,29 @@ func (r *FileEventsRepo) RewritePathPrefix(tx *sql.Tx, rootID, oldPrefix, newPre
 	return err
 }
 
-func (r *FileEventsRepo) CountUnprocessedByRoot() (map[string]int, error) {
-	rows, err := r.db.Query(`SELECT root_id, COUNT(*) FROM file_events
-		WHERE processed_at IS NULL GROUP BY root_id`)
-	if err != nil {
-		return nil, err
+// CountUnprocessedByRoot returns a SATURATED per-root backlog: for each id in
+// rootIDs, the number of unprocessed rows capped at limitPerRoot. Callers
+// (storm fuse, reconcile picker) only need "over threshold?" and "which is
+// largest?", so a bounded count is enough — and it keeps the cost O(limit)
+// instead of O(table) on the once-per-second hot path (spec §3.1). Roots with
+// zero backlog are absent from the map (same contract as the old GROUP BY).
+func (r *FileEventsRepo) CountUnprocessedByRoot(rootIDs []string, limitPerRoot int) (map[string]int, error) {
+	if limitPerRoot <= 0 {
+		limitPerRoot = 1
 	}
-	defer rows.Close()
-	out := map[string]int{}
-	for rows.Next() {
-		var id string
+	out := make(map[string]int, len(rootIDs))
+	for _, id := range rootIDs {
 		var n int
-		if err := rows.Scan(&id, &n); err != nil {
+		err := r.db.QueryRow(`SELECT COUNT(*) FROM (SELECT 1 FROM file_events
+			WHERE root_id = ? AND processed_at IS NULL LIMIT ?)`, id, limitPerRoot).Scan(&n)
+		if err != nil {
 			return nil, err
 		}
-		out[id] = n
+		if n > 0 {
+			out[id] = n
+		}
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func (r *FileEventsRepo) CountAll() (int64, error) {
