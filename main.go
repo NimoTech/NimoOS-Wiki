@@ -617,16 +617,23 @@ func archiveSweep(ev *repo.FileEventsRepo, roots *repo.WikiRootsRepo,
 	if maxRows <= 0 {
 		return
 	}
-	purged, affected, err := ev.PurgeOldestOverCap(maxRows)
+	purged, err := ev.PurgeOldestOverCap(maxRows)
 	if err != nil {
 		log.Warn("row-cap purge", zap.Error(err))
 		return
 	}
 	if purged > 0 {
-		log.Warn("file_events over row cap: purged oldest",
-			zap.Int64("purged", purged), zap.Strings("roots", affected))
-		for _, id := range affected {
-			_ = roots.SetNeedsReconcile(id, true)
-		}
+		log.Warn("file_events over row cap: purged oldest", zap.Int64("purged", purged))
+		markAllEnabledNeedsReconcile(roots)
+	}
+}
+
+// markAllEnabledNeedsReconcile is the conservative reaction to any cap purge
+// (spec §3.2): Wiki cannot know which roots' unconsumed rows were destroyed,
+// and computing the affected set is itself a whole-table DISTINCT, so mark
+// every enabled root and let the 30s reconcile loop drain them one at a time.
+func markAllEnabledNeedsReconcile(roots *repo.WikiRootsRepo) {
+	for _, r := range listEnabled(roots) {
+		_ = roots.SetNeedsReconcile(r.ID, true)
 	}
 }

@@ -222,21 +222,48 @@ func (r *FileEventsRepo) MarkProcessed(ids []string, atMs int64) error {
 	return err
 }
 
-func (r *FileEventsRepo) ArchiveOlderThan(cutoffMs int64) (int64, error) {
-	res, err := r.db.Exec(`UPDATE file_events SET archived = 1
-		WHERE archived = 0 AND detected_at < ?`, cutoffMs)
-	if err != nil {
+// purgeBatch bounds every maintenance UPDATE/DELETE to one statement-sized
+// transaction so a bloated table is trimmed without a minutes-long write lock
+// or an unbounded WAL (spec §3.2).
+const purgeBatch = 50000
+
+// MaxRowID is an O(1) upper bound on the row count (rowid is monotonic; gaps
+// from earlier deletes only make the bound conservative).
+func (r *FileEventsRepo) MaxRowID() (int64, error) {
+	var n sql.NullInt64
+	if err := r.db.QueryRow(`SELECT MAX(rowid) FROM file_events`).Scan(&n); err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	return n.Int64, nil
+}
+
+// execBatches runs stmt — which must end with `LIMIT ?)` — repeatedly with
+// purgeBatch appended to args until a batch affects fewer than purgeBatch
+// rows. Returns the total rows affected.
+func (r *FileEventsRepo) execBatches(stmt string, args ...interface{}) (int64, error) {
+	var total int64
+	for {
+		full := append(append([]interface{}{}, args...), purgeBatch)
+		res, err := r.db.Exec(stmt, full...)
+		if err != nil {
+			return total, err
+		}
+		n, _ := res.RowsAffected()
+		total += n
+		if n < purgeBatch {
+			return total, nil
+		}
+	}
+}
+
+func (r *FileEventsRepo) ArchiveOlderThan(cutoffMs int64) (int64, error) {
+	return r.execBatches(`UPDATE file_events SET archived = 1 WHERE rowid IN (
+		SELECT rowid FROM file_events WHERE archived = 0 AND detected_at < ? LIMIT ?)`, cutoffMs)
 }
 
 func (r *FileEventsRepo) PurgeOlderThan(cutoffMs int64) (int64, error) {
-	res, err := r.db.Exec(`DELETE FROM file_events WHERE detected_at < ?`, cutoffMs)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
+	return r.execBatches(`DELETE FROM file_events WHERE rowid IN (
+		SELECT rowid FROM file_events WHERE detected_at < ? LIMIT ?)`, cutoffMs)
 }
 
 func (r *FileEventsRepo) RewritePathPrefix(tx *sql.Tx, rootID, oldPrefix, newPrefix string) error {
@@ -282,47 +309,32 @@ func (r *FileEventsRepo) CountAll() (int64, error) {
 }
 
 // PurgeOldestOverCap deletes the oldest rows so the table holds at most
-// maxRows, and returns the distinct root_ids of the deleted rows so callers
-// can mark those roots needs_reconcile (spec §4.2: Wiki cannot know the
-// Parser consumer's cursor, so every capped purge is treated as potentially
-// destroying unconsumed rows and self-heals via reconcile).
-func (r *FileEventsRepo) PurgeOldestOverCap(maxRows int64) (int64, []string, error) {
-	total, err := r.CountAll()
+// maxRows. "Oldest" is by rowid (monotonic ≈ detected_at) so the cutoff is
+// found by walking the table b-tree — no ORDER BY sort, no temp store. The
+// row count must be EXACT (CountAll): MaxRowID is only an upper bound and
+// using it here deletes the whole table when bound-cap equals the real row
+// count. A NULL cutoff is kept as a defensive no-op.
+// Callers must treat any purge as potentially destroying unconsumed rows and
+// mark roots needs_reconcile (spec §3.2).
+func (r *FileEventsRepo) PurgeOldestOverCap(maxRows int64) (int64, error) {
+	total, err := r.CountAll() // exact: COUNT(*) is an index b-tree walk, O(1) memory
 	if err != nil || total <= maxRows {
-		return 0, nil, err
+		return 0, err
 	}
-	over := total - maxRows
-	// cutoff = detected_at of the last row to delete (oldest `over` rows)
-	var cutoff int64
-	err = r.db.QueryRow(`SELECT detected_at FROM file_events
-		ORDER BY detected_at LIMIT 1 OFFSET ?`, over-1).Scan(&cutoff)
+	var cutoff sql.NullInt64
+	err = r.db.QueryRow(`SELECT rowid FROM file_events ORDER BY rowid LIMIT 1 OFFSET ?`,
+		total-maxRows-1).Scan(&cutoff)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
 	if err != nil {
-		return 0, nil, err
+		return 0, err
 	}
-	rows, err := r.db.Query(`SELECT DISTINCT root_id FROM file_events
-		WHERE detected_at <= ?`, cutoff)
-	if err != nil {
-		return 0, nil, err
+	if !cutoff.Valid {
+		return 0, nil
 	}
-	var roots []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return 0, nil, err
-		}
-		roots = append(roots, id)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return 0, nil, err
-	}
-	res, err := r.db.Exec(`DELETE FROM file_events WHERE detected_at <= ?`, cutoff)
-	if err != nil {
-		return 0, nil, err
-	}
-	n, _ := res.RowsAffected()
-	return n, roots, nil
+	return r.execBatches(`DELETE FROM file_events WHERE rowid IN (
+		SELECT rowid FROM file_events WHERE rowid <= ? LIMIT ?)`, cutoff.Int64)
 }
 
 func nullableStr(s string) interface{} {
