@@ -287,6 +287,14 @@ func TestWatcher_ExcludePrefixNeverWatchedNorRecorded(t *testing.T) {
 	defer cancel()
 	go w.Run(ctx)
 
+	// Simulate a kernel watch left over from before ExcludePrefixes was
+	// configured: add it directly, bypassing Watch's walk, so real events for
+	// data/ DO reach handle() and must be dropped there (not merely never
+	// generated because the dir was skipped at watch time).
+	w.mu.Lock()
+	require.NoError(t, w.fsw.Add(data))
+	w.mu.Unlock()
+
 	require.NoError(t, os.WriteFile(filepath.Join(data, "wiki.db-wal"), []byte("x"), 0644))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "doc.md"), []byte("hi"), 0644))
 
