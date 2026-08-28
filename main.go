@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	_ "embed"
 	"errors"
 	"flag"
@@ -585,8 +586,90 @@ func reconcileTick(ctx context.Context, r *repo.WikiRootsRepo, rec *scanner.Reco
 	}
 }
 
+// startupSweep trims file_events BEFORE any per-second loop touches it
+// (spec §3.4). Two paths:
+//   - bloated (rowid bound > 10×cap): DROP + recreate the table (derived
+//     data), mark every enabled root needs_reconcile, then VACUUM when the
+//     filesystem has ≥1.2× the db size free. This is the 143 case: a 39 GB /
+//     153M-row table that batch-deleting would take longer than systemd's
+//     patience.
+//   - otherwise: one regular archiveSweep pass (batched, index-backed).
+//
+// Failures are logged and never block startup, except a DROP whose recreate
+// fails — a missing table breaks every insert, so exit and let systemd retry.
+// availBytes is injected so tests don't depend on the real filesystem.
+func startupSweep(ev *repo.FileEventsRepo, roots *repo.WikiRootsRepo, d *sql.DB, dbPath string,
+	keepDays int, maxRows int64, availBytes func(dir string) (uint64, error), log *zap.Logger) {
+	if maxRows <= 0 {
+		log.Info("file_events startup sweep skipped: row cap disabled")
+		return
+	}
+	top, err := ev.MaxRowID() // O(1) pre-filter; exact count only when it looks bloated
+	if err != nil {
+		log.Warn("startup sweep: max rowid", zap.Error(err))
+		return
+	}
+	total := top
+	if top > 10*maxRows {
+		if total, err = ev.CountAll(); err != nil {
+			log.Warn("startup sweep: count", zap.Error(err))
+			return
+		}
+	}
+	log.Info("file_events at startup", zap.Int64("rows", total), zap.Int64("rowid_bound", top), zap.Int64("cap", maxRows))
+
+	if total > 10*maxRows {
+		size := fileSize(dbPath)
+		if err := db.RecreateFileEvents(d); err != nil {
+			log.Fatal("startup sweep: recreate file_events failed", zap.Error(err))
+		}
+		markAllEnabledNeedsReconcile(roots)
+		log.Warn("file_events bloated: table dropped and recreated; all roots marked needs_reconcile",
+			zap.Int64("rows", total), zap.Int64("db_bytes", size))
+
+		avail, aerr := availBytes(filepath.Dir(dbPath))
+		need := uint64(float64(size) * 1.2)
+		if aerr != nil || avail < need {
+			log.Warn("skip VACUUM: insufficient free space",
+				zap.Uint64("avail_bytes", avail), zap.Uint64("need_bytes", need), zap.Error(aerr))
+			return
+		}
+		t0 := time.Now()
+		if _, err := d.Exec(`VACUUM`); err != nil {
+			log.Warn("VACUUM failed", zap.Error(err))
+			return
+		}
+		log.Info("VACUUM done", zap.Duration("took", time.Since(t0)),
+			zap.Int64("db_bytes_after", fileSize(dbPath)))
+		return
+	}
+
+	t0 := time.Now()
+	archiveSweep(ev, roots, keepDays, maxRows, log)
+	log.Info("file_events startup sweep done", zap.Duration("took", time.Since(t0)))
+}
+
+func fileSize(p string) int64 {
+	fi, err := os.Stat(p)
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
+}
+
+// diskAvail returns bytes available to unprivileged writers on dir's filesystem.
+func diskAvail(dir string) (uint64, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(dir, &st); err != nil {
+		return 0, err
+	}
+	return st.Bavail * uint64(st.Bsize), nil
+}
+
 // runArchiveJob runs hourly: archive file_events > keepDays old, purge events
 // > 2x keepDays old, plus the hard row cap (spec §4.2) via archiveSweep.
+// archiveSweep itself now also defaults keepDays <= 0 to 90, since it is
+// shared with startupSweep's regular-path call.
 func runArchiveJob(ctx context.Context, ev *repo.FileEventsRepo, roots *repo.WikiRootsRepo,
 	keepDays int, maxRows int64) {
 	if keepDays <= 0 {
@@ -610,6 +693,9 @@ func runArchiveJob(ctx context.Context, ev *repo.FileEventsRepo, roots *repo.Wik
 // Parser cursor, so treat every capped purge as destroying unconsumed rows.
 func archiveSweep(ev *repo.FileEventsRepo, roots *repo.WikiRootsRepo,
 	keepDays int, maxRows int64, log *zap.Logger) {
+	if keepDays <= 0 {
+		keepDays = 90
+	}
 	archiveCutoff := time.Now().Add(-time.Duration(keepDays) * 24 * time.Hour).UnixMilli()
 	purgeCutoff := time.Now().Add(-time.Duration(keepDays*2) * 24 * time.Hour).UnixMilli()
 	_, _ = ev.ArchiveOlderThan(archiveCutoff)

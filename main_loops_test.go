@@ -430,3 +430,97 @@ func TestAuthzPushRetryTick_PendingSignalSkipsProbe(t *testing.T) {
 	require.Equal(t, 0, fr.probes, "a pending signal already implies a Reconcile; no probe needed")
 	require.Len(t, fr.calls, 1)
 }
+
+func insertEvents(t *testing.T, ev *repo.FileEventsRepo, n int) {
+	t.Helper()
+	now := time.Now().UnixMilli()
+	for i := 0; i < n; i++ {
+		require.NoError(t, ev.Insert(repo.FileEvent{
+			ID: repo.NewID(), RootID: "rootA", Path: fmt.Sprintf("/p/%d", i),
+			Op: "create", DetectedAt: now + int64(i),
+		}))
+	}
+}
+
+func insertRoot(t *testing.T, roots *repo.WikiRootsRepo, id string) {
+	t.Helper()
+	require.NoError(t, roots.Insert(repo.WikiRoot{
+		ID: id, Path: "/" + id, Level: "space", WatchMode: "auto",
+		StorageMode: "inline", Enabled: true, ScanIntervalS: 600, CreatedAt: time.Now().UnixMilli(),
+	}))
+}
+
+func TestStartupSweep_RegularPathTrimsToCap(t *testing.T) {
+	d := openMainTestDB(t)
+	ev := repo.NewFileEvents(d)
+	roots := repo.NewWikiRoots(d)
+	insertRoot(t, roots, "rootA")
+	insertEvents(t, ev, 10)
+
+	// 10 rows, cap 6: 10 <= 10*6 so the regular path (archiveSweep) runs.
+	startupSweep(ev, roots, d, ":memory:", 90, 6,
+		func(string) (uint64, error) { return 1 << 40, nil }, zap.NewNop())
+
+	total, err := ev.CountAll()
+	require.NoError(t, err)
+	require.EqualValues(t, 6, total)
+	g, err := roots.Get("rootA")
+	require.NoError(t, err)
+	require.True(t, g.NeedsReconcile)
+}
+
+func TestStartupSweep_BloatedFastPathRecreatesTable(t *testing.T) {
+	d := openMainTestDB(t)
+	ev := repo.NewFileEvents(d)
+	roots := repo.NewWikiRoots(d)
+	insertRoot(t, roots, "rootA")
+	insertRoot(t, roots, "rootB")
+	insertEvents(t, ev, 101) // > 10 * cap(10) → DROP + recreate
+
+	vacuumed := false
+	startupSweep(ev, roots, d, ":memory:", 90, 10,
+		func(string) (uint64, error) { vacuumed = true; return 1 << 40, nil }, zap.NewNop())
+
+	total, err := ev.CountAll()
+	require.NoError(t, err)
+	require.Zero(t, total, "fast path empties the table instead of batch-deleting")
+	require.True(t, vacuumed, "free-space probe (and thus VACUUM) must run on the fast path")
+	for _, id := range []string{"rootA", "rootB"} {
+		g, err := roots.Get(id)
+		require.NoError(t, err)
+		require.True(t, g.NeedsReconcile, id)
+	}
+	// Table is usable again right away.
+	require.NoError(t, ev.Insert(repo.FileEvent{ID: repo.NewID(), RootID: "rootA", Path: "/x", Op: "create", DetectedAt: 1}))
+}
+
+func TestStartupSweep_FastPathSkipsVacuumWhenLowDisk(t *testing.T) {
+	d := openMainTestDB(t)
+	ev := repo.NewFileEvents(d)
+	roots := repo.NewWikiRoots(d)
+	insertRoot(t, roots, "rootA")
+	insertEvents(t, ev, 101)
+
+	// avail probe errors → VACUUM skipped, but recreate still happened.
+	startupSweep(ev, roots, d, ":memory:", 90, 10,
+		func(string) (uint64, error) { return 0, fmt.Errorf("statfs: boom") }, zap.NewNop())
+
+	total, err := ev.CountAll()
+	require.NoError(t, err)
+	require.Zero(t, total)
+}
+
+func TestStartupSweep_CapDisabledIsNoop(t *testing.T) {
+	d := openMainTestDB(t)
+	ev := repo.NewFileEvents(d)
+	roots := repo.NewWikiRoots(d)
+	insertRoot(t, roots, "rootA")
+	insertEvents(t, ev, 50)
+
+	startupSweep(ev, roots, d, ":memory:", 90, 0,
+		func(string) (uint64, error) { return 1 << 40, nil }, zap.NewNop())
+
+	total, err := ev.CountAll()
+	require.NoError(t, err)
+	require.EqualValues(t, 50, total)
+}
