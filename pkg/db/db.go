@@ -13,7 +13,6 @@ PRAGMA busy_timeout = 5000;
 PRAGMA synchronous = NORMAL;
 PRAGMA case_sensitive_like = ON;
 PRAGMA foreign_keys = ON;
-PRAGMA temp_store = MEMORY;
 `
 
 // Open opens (and creates if needed) the wiki sqlite DB.
