@@ -305,6 +305,15 @@ func (r *FileEventsRepo) CountUnprocessedByRoot(rootIDs []string, limitPerRoot i
 	return out, nil
 }
 
+// CountAtMost returns min(rows, limit) — a saturated row count that stops after
+// `limit` rows instead of walking the whole table. Used by startupSweep to decide
+// "bloated or not" without an O(n) COUNT(*) on a 150M-row table.
+func (r *FileEventsRepo) CountAtMost(limit int64) (int64, error) {
+	var n int64
+	err := r.db.QueryRow(`SELECT COUNT(*) FROM (SELECT 1 FROM file_events LIMIT ?)`, limit).Scan(&n)
+	return n, err
+}
+
 func (r *FileEventsRepo) CountAll() (int64, error) {
 	var n int64
 	err := r.db.QueryRow(`SELECT COUNT(*) FROM file_events`).Scan(&n)

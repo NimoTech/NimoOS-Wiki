@@ -9,6 +9,8 @@ ExecStart=/usr/bin/nimoos-wiki -c /etc/nimoos/wiki.conf
 PIDFile=/var/run/nimoos/wiki.pid
 Restart=always
 Type=notify
+# startupSweep may trim/rebuild a bloated file_events table before READY
+TimeoutStartSec=1800
 
 [Install]
 WantedBy=multi-user.target

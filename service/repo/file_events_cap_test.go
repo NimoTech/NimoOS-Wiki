@@ -5,11 +5,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NimoTech/NimoOS-Wiki/pkg/db"
 	"github.com/stretchr/testify/require"
 )
 
 func TestCountUnprocessedByRoot_Saturated(t *testing.T) {
 	d := openTestDB(t)
+	// db.Open no longer builds the backlog index (it is built after
+	// startupSweep); the EXPLAIN assertion below needs it.
+	require.NoError(t, db.EnsureBacklogIndex(d))
 	ev := NewFileEvents(d)
 	for i := 0; i < 30; i++ {
 		mustInsert(t, ev, "rootA", fmt.Sprintf("/a/%d", i))
@@ -134,6 +138,26 @@ func TestPurgeAndArchiveOlderThan_Batched(t *testing.T) {
 	total, err := ev.CountAll()
 	require.NoError(t, err)
 	require.EqualValues(t, 5000, total)
+}
+
+func TestCountAtMost(t *testing.T) {
+	d := openTestDB(t)
+	ev := NewFileEvents(d)
+
+	n, err := ev.CountAtMost(10)
+	require.NoError(t, err)
+	require.Zero(t, n, "empty table")
+
+	for i := 0; i < 30; i++ {
+		mustInsert(t, ev, "rootA", fmt.Sprintf("/a/%d", i))
+	}
+	n, err = ev.CountAtMost(10)
+	require.NoError(t, err)
+	require.EqualValues(t, 10, n, "saturates at the limit")
+
+	n, err = ev.CountAtMost(100)
+	require.NoError(t, err)
+	require.EqualValues(t, 30, n, "exact below the limit")
 }
 
 func mustInsert(t *testing.T, ev *FileEventsRepo, root, path string) {

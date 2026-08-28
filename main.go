@@ -36,10 +36,11 @@ import (
 	"go.uber.org/zap"
 )
 
-// DefaultBacklogCountLimit bounds CountUnprocessedByRoot when no StormGuard is
-// configured (tests / fuse disabled). Large enough to rank roots by backlog,
-// small enough to stay O(limit) on a bloated table.
-const DefaultBacklogCountLimit = 200000
+// reconcileBacklogLimit bounds CountUnprocessedByRoot in reconcileTick. The
+// count is only used to RANK needs_reconcile roots against each other, so a
+// small saturation point is enough — and it keeps the 30s tick O(1000) per
+// root instead of O(fuse limit) on a bloated table.
+const reconcileBacklogLimit = 1000
 
 var (
 	commit = "private build"
@@ -102,8 +103,15 @@ func main() {
 	// Trim / rebuild file_events BEFORE any loop issues its first query
 	// (spec §3.4). Synchronous on purpose: a bloated table must never meet
 	// the once-per-second fuse tick.
+	stopHB := startupHeartbeat(zapLog)
 	startupSweep(rEvents, rRoots, d, dbPath, config.Cfg.RecentChangesRetentionDays,
 		config.Cfg.EventMaxRows, diskAvail, zapLog)
+	// Built only now: on a bloated table this index costs minutes and GBs of
+	// WAL, so it must come after the sweep has trimmed or rebuilt the table.
+	if err := db.EnsureBacklogIndex(d); err != nil {
+		zapLog.Warn("ensure backlog index", zap.Error(err)) // count queries still work, just slower
+	}
+	stopHB()
 
 	// Services
 	bus := eventbus.New(config.Cfg.RuntimePath)
@@ -126,13 +134,16 @@ func main() {
 	rec.ThrottleEvery = config.Cfg.WalkThrottleEvery
 	rec.ThrottleSleep = time.Duration(config.Cfg.WalkThrottleSleepMs) * time.Millisecond
 	wch := scanner.NewWatcher(rEvents, rNodes, ig, guard, zapLog)
-	// Never watch or record our own data dir (spec §3.5). Resolve symlinks so
-	// a bind-mounted /var/lib/nimoos/wiki matches its /DATA/.system_data path.
+	// Never watch or record our own data dir (spec §3.5). Resolve symlinks so an
+	// aliased DataPath matches the path fsnotify reports. Bind mounts are not
+	// resolved by EvalSymlinks; the container-dir ancestor filter (.system_data
+	// is in the ignore baseline) covers that case.
 	if real, err := filepath.EvalSymlinks(config.Cfg.DataPath); err == nil {
 		wch.ExcludePrefixes = []string{filepath.Clean(real)}
 	} else {
 		wch.ExcludePrefixes = []string{filepath.Clean(config.Cfg.DataPath)}
 	}
+	zapLog.Info("watcher exclude prefixes", zap.Strings("prefixes", wch.ExcludePrefixes))
 	mgr.SetWatch(wch)
 	// Runtime watch-limit hits (new dirs created after startup) degrade the
 	// root the same way a registration-time hit below does.
@@ -526,13 +537,6 @@ func rootIDs(roots []repo.WikiRoot) []string {
 	return out
 }
 
-func backlogLimit(guard *scanner.StormGuard) int {
-	if guard == nil {
-		return DefaultBacklogCountLimit
-	}
-	return guard.CountLimit()
-}
-
 // runReconcilerLoop polls every 30 seconds and calls reconcileTick: at most
 // one needs_reconcile root is drained first (largest backlog, spec §4.2
 // staggering), then regular interval-due reconciles run.
@@ -559,7 +563,7 @@ func reconcileTick(ctx context.Context, r *repo.WikiRootsRepo, rec *scanner.Reco
 	guard *scanner.StormGuard, ev *repo.FileEventsRepo, log *zap.Logger) {
 	now := time.Now().UnixMilli()
 	enabled := listEnabled(r)
-	backlogs, _ := ev.CountUnprocessedByRoot(rootIDs(enabled), backlogLimit(guard))
+	backlogs, _ := ev.CountUnprocessedByRoot(rootIDs(enabled), reconcileBacklogLimit)
 
 	// 1) one needs_reconcile root per tick
 	var pick *repo.WikiRoot
@@ -600,49 +604,104 @@ func reconcileTick(ctx context.Context, r *repo.WikiRootsRepo, rec *scanner.Reco
 	}
 }
 
+// startupHeartbeat keeps systemd from killing a Type=notify service while the
+// synchronous startupSweep runs: every 20s it asks for another 60s of start
+// timeout. Harmless when not under systemd (SdNotify returns sent=false).
+func startupHeartbeat(log *zap.Logger) (stop func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(20 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if _, err := daemon.SdNotify(false, "EXTEND_TIMEOUT_USEC=60000000"); err != nil {
+					log.Debug("sd_notify extend", zap.Error(err))
+				}
+			}
+		}
+	}()
+	return func() { cancel(); <-done }
+}
+
 // startupSweep trims file_events BEFORE any per-second loop touches it
 // (spec §3.4). Two paths:
-//   - bloated (rowid bound > 10×cap): DROP + recreate the table (derived
-//     data), mark every enabled root needs_reconcile, then VACUUM when the
-//     filesystem has ≥1.2× the db size free. This is the 143 case: a 39 GB /
-//     153M-row table that batch-deleting would take longer than systemd's
+//   - bloated (rowid bound AND saturated count > 10×cap): DROP + recreate the
+//     table (derived data), mark every enabled root needs_reconcile, then
+//     VACUUM + truncating WAL checkpoint when the filesystem has ≥1.2× the
+//     surviving (live, non-freelist) bytes free. This is the 143 case: a 39 GB
+//     / 153M-row table that batch-deleting would take longer than systemd's
 //     patience.
 //   - otherwise: one regular archiveSweep pass (batched, index-backed).
 //
-// Failures are logged and never block startup, except a DROP whose recreate
-// fails — a missing table breaks every insert, so exit and let systemd retry.
-// availBytes is injected so tests don't depend on the real filesystem.
+// Failures are logged and never block startup, except a recreate that leaves
+// no file_events table at all — that breaks every insert, so exit and let
+// systemd retry. availBytes is injected so tests don't depend on the real
+// filesystem.
 func startupSweep(ev *repo.FileEventsRepo, roots *repo.WikiRootsRepo, d *sql.DB, dbPath string,
 	keepDays int, maxRows int64, availBytes func(dir string) (uint64, error), log *zap.Logger) {
 	if maxRows <= 0 {
 		log.Info("file_events startup sweep skipped: row cap disabled")
 		return
 	}
-	top, err := ev.MaxRowID() // O(1) pre-filter; exact count only when it looks bloated
+	top, err := ev.MaxRowID() // O(1) pre-filter; saturated count only when it looks bloated
 	if err != nil {
 		log.Warn("startup sweep: max rowid", zap.Error(err))
 		return
 	}
-	total := top
-	if top > 10*maxRows {
-		if total, err = ev.CountAll(); err != nil {
+	threshold := 10 * maxRows
+	bloated := false
+	if top > threshold {
+		n, err := ev.CountAtMost(threshold + 1)
+		if err != nil {
 			log.Warn("startup sweep: count", zap.Error(err))
 			return
 		}
+		bloated = n > threshold
 	}
-	log.Info("file_events at startup", zap.Int64("rows", total), zap.Int64("rowid_bound", top), zap.Int64("cap", maxRows))
+	if bloated {
+		log.Info("file_events at startup", zap.String("rows", fmt.Sprintf(">%d", threshold)),
+			zap.Int64("rowid_bound", top), zap.Int64("cap", maxRows))
+	} else {
+		log.Info("file_events at startup", zap.Int64("rowid_bound", top), zap.Int64("cap", maxRows))
+	}
 
-	if total > 10*maxRows {
+	if bloated {
 		size := fileSize(dbPath)
 		if err := db.RecreateFileEvents(d); err != nil {
-			log.Fatal("startup sweep: recreate file_events failed", zap.Error(err))
+			// The recreate is a single transaction, so a failure normally leaves
+			// the old table intact and the hourly sweep is a fine fallback:
+			// Fatal-ing a healthy process would recreate the very restart loop
+			// this code exists to end. Only a genuinely missing table (every
+			// insert would fail) is worth exiting for.
+			log.Warn("startup sweep: recreate file_events failed", zap.Error(err))
+			var tables int
+			if qerr := d.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='file_events'`).
+				Scan(&tables); qerr == nil && tables == 0 {
+				log.Fatal("file_events table missing after failed recreate")
+			}
+			return
 		}
-		markAllEnabledNeedsReconcile(roots)
+		// Belt and braces: RecreateFileEvents already marked every enabled root
+		// in the same transaction; this is idempotent and surfaces repo errors.
+		markAllEnabledNeedsReconcile(roots, log)
+
+		// VACUUM needs room for a full copy of the LIVE pages, not of the
+		// pre-drop file: after the DROP almost the whole file is freelist.
+		var pageCount, freelist, pageSize int64
+		_ = d.QueryRow(`PRAGMA page_count`).Scan(&pageCount)
+		_ = d.QueryRow(`PRAGMA freelist_count`).Scan(&freelist)
+		_ = d.QueryRow(`PRAGMA page_size`).Scan(&pageSize)
+		live := (pageCount - freelist) * pageSize
+		need := uint64(float64(live) * 1.2)
 		log.Warn("file_events bloated: table dropped and recreated; all roots marked needs_reconcile",
-			zap.Int64("rows", total), zap.Int64("db_bytes", size))
+			zap.Int64("rowid_bound", top), zap.Int64("db_bytes", size), zap.Int64("live_bytes", live))
 
 		avail, aerr := availBytes(filepath.Dir(dbPath))
-		need := uint64(float64(size) * 1.2)
 		if aerr != nil || avail < need {
 			log.Warn("skip VACUUM: insufficient free space",
 				zap.Uint64("avail_bytes", avail), zap.Uint64("need_bytes", need), zap.Error(aerr))
@@ -652,6 +711,11 @@ func startupSweep(ev *repo.FileEventsRepo, roots *repo.WikiRootsRepo, d *sql.DB,
 		if _, err := d.Exec(`VACUUM`); err != nil {
 			log.Warn("VACUUM failed", zap.Error(err))
 			return
+		}
+		// Without a truncating checkpoint the reclaimed space stays in the WAL,
+		// so db_bytes_after would be a lie and the disk stays full.
+		if _, err := d.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			log.Warn("wal checkpoint after VACUUM", zap.Error(err))
 		}
 		log.Info("VACUUM done", zap.Duration("took", time.Since(t0)),
 			zap.Int64("db_bytes_after", fileSize(dbPath)))
@@ -712,8 +776,12 @@ func archiveSweep(ev *repo.FileEventsRepo, roots *repo.WikiRootsRepo,
 	}
 	archiveCutoff := time.Now().Add(-time.Duration(keepDays) * 24 * time.Hour).UnixMilli()
 	purgeCutoff := time.Now().Add(-time.Duration(keepDays*2) * 24 * time.Hour).UnixMilli()
-	_, _ = ev.ArchiveOlderThan(archiveCutoff)
-	_, _ = ev.PurgeOlderThan(purgeCutoff)
+	if _, err := ev.ArchiveOlderThan(archiveCutoff); err != nil {
+		log.Warn("archive older than", zap.Error(err))
+	}
+	if _, err := ev.PurgeOlderThan(purgeCutoff); err != nil {
+		log.Warn("purge older than", zap.Error(err))
+	}
 	if maxRows <= 0 {
 		return
 	}
@@ -722,7 +790,7 @@ func archiveSweep(ev *repo.FileEventsRepo, roots *repo.WikiRootsRepo,
 	// gone: mark roots whenever anything was purged, THEN report the error.
 	if purged > 0 {
 		log.Warn("file_events over row cap: purged oldest", zap.Int64("purged", purged))
-		markAllEnabledNeedsReconcile(roots)
+		markAllEnabledNeedsReconcile(roots, log)
 	}
 	if err != nil {
 		log.Warn("row-cap purge", zap.Error(err))
@@ -733,8 +801,18 @@ func archiveSweep(ev *repo.FileEventsRepo, roots *repo.WikiRootsRepo,
 // (spec §3.2): Wiki cannot know which roots' unconsumed rows were destroyed,
 // and computing the affected set is itself a whole-table DISTINCT, so mark
 // every enabled root and let the 30s reconcile loop drain them one at a time.
-func markAllEnabledNeedsReconcile(roots *repo.WikiRootsRepo) {
-	for _, r := range listEnabled(roots) {
-		_ = roots.SetNeedsReconcile(r.ID, true)
+func markAllEnabledNeedsReconcile(roots *repo.WikiRootsRepo, log *zap.Logger) {
+	all, err := roots.List()
+	if err != nil {
+		log.Warn("mark needs_reconcile: list roots", zap.Error(err))
+		return
+	}
+	for _, r := range all {
+		if !r.Enabled {
+			continue
+		}
+		if err := roots.SetNeedsReconcile(r.ID, true); err != nil {
+			log.Warn("mark needs_reconcile", zap.String("root_id", r.ID), zap.Error(err))
+		}
 	}
 }

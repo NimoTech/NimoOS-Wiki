@@ -73,7 +73,7 @@ var migrations = []string{
 	fileEventsDDL,
 	fileEventsIdxUnprocessed,
 	fileEventsIdxArchiveQ,
-	fileEventsIdxBacklog,
+	// fileEventsIdxBacklog is deliberately NOT here — see EnsureBacklogIndex.
 	`CREATE TABLE IF NOT EXISTS parse_status (
 		id TEXT PRIMARY KEY,
 		path TEXT UNIQUE NOT NULL,
@@ -153,16 +153,29 @@ func runMigrations(d *sql.DB) error {
 	return nil
 }
 
+// EnsureBacklogIndex builds idx_file_events_backlog. It is deliberately NOT part
+// of runMigrations: on a bloated table the build takes minutes and gigabytes of
+// WAL, so it must run only after startupSweep has trimmed or rebuilt the table.
+// The only consumer (CountUnprocessedByRoot) runs in loops that start after it.
+func EnsureBacklogIndex(d *sql.DB) error {
+	_, err := d.Exec(fileEventsIdxBacklog)
+	return err
+}
+
 // RecreateFileEvents drops and recreates file_events with its indexes in one
 // transaction — the bloated-table fast path (spec §3.4). The table is derived
-// data; callers must mark every root needs_reconcile afterwards.
+// data, and marks every enabled root needs_reconcile in the same transaction,
+// so a crash between DROP and mark cannot lose the reconcile signal.
 func RecreateFileEvents(d *sql.DB) error {
 	tx, err := d.Begin()
 	if err != nil {
 		return err
 	}
 	stmts := []string{`DROP TABLE IF EXISTS file_events`, fileEventsDDL,
-		fileEventsIdxUnprocessed, fileEventsIdxArchiveQ, fileEventsIdxBacklog}
+		fileEventsIdxUnprocessed, fileEventsIdxArchiveQ, fileEventsIdxBacklog,
+		// Same transaction as the DROP: a crash in between must not lose the
+		// reconcile signal for the rows this just destroyed.
+		`UPDATE wiki_roots SET needs_reconcile = 1 WHERE enabled = 1`}
 	for _, stmt := range stmts {
 		if _, err := tx.Exec(stmt); err != nil {
 			_ = tx.Rollback()
