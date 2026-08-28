@@ -256,3 +256,86 @@ func TestWatchRootEACCESReturnsErrWatchRootFailed(t *testing.T) {
 	err := w.Watch("r", dir)
 	require.ErrorIs(t, err, ErrWatchRootFailed)
 }
+
+func countEventsUnder(t *testing.T, events *repo.FileEventsRepo, prefix string) int {
+	t.Helper()
+	evs, err := events.ListUnprocessed(1000)
+	require.NoError(t, err)
+	n := 0
+	for _, e := range evs {
+		if strings.HasPrefix(e.Path, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+func TestWatcher_ExcludePrefixNeverWatchedNorRecorded(t *testing.T) {
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	events := repo.NewFileEvents(d)
+	nodes := repo.NewWikiNodes(d)
+	root := t.TempDir()
+	data := filepath.Join(root, "var-lib-wiki") // stands in for DataPath living under the root
+	require.NoError(t, os.MkdirAll(data, 0755))
+
+	w := NewWatcher(events, nodes, ignore.New(nil), nil, nil)
+	w.ExcludePrefixes = []string{data}
+	require.NoError(t, w.Watch("r", root))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx)
+
+	require.NoError(t, os.WriteFile(filepath.Join(data, "wiki.db-wal"), []byte("x"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "doc.md"), []byte("hi"), 0644))
+
+	require.Eventually(t, func() bool {
+		return countEventsUnder(t, events, filepath.Join(root, "doc.md")) >= 1
+	}, 2*time.Second, 50*time.Millisecond)
+	require.Zero(t, countEventsUnder(t, events, data), "events under an excluded prefix must be dropped")
+
+	// Directories created later under the excluded prefix are not watched either.
+	sub := filepath.Join(data, "later")
+	require.NoError(t, os.MkdirAll(sub, 0755))
+	time.Sleep(200 * time.Millisecond)
+	require.NoError(t, os.WriteFile(filepath.Join(sub, "f"), []byte("x"), 0644))
+	time.Sleep(300 * time.Millisecond)
+	require.Zero(t, countEventsUnder(t, events, data))
+}
+
+func TestWatcher_ContainerAncestorEventsDroppedEvenWithStaleWatch(t *testing.T) {
+	w, events, _, root := setupWatcher(t) // ignore matcher has node_modules + baseline (.system_data)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx)
+
+	deep := filepath.Join(root, ".system_data", "nimoos", "wiki")
+	require.NoError(t, os.MkdirAll(deep, 0755))
+	time.Sleep(200 * time.Millisecond)
+	// Simulate a kernel watch left over from an older binary that did not
+	// skip container dirs: add it directly, bypassing Watch's walk.
+	w.mu.Lock()
+	require.NoError(t, w.fsw.Add(deep))
+	w.mu.Unlock()
+
+	require.NoError(t, os.WriteFile(filepath.Join(deep, "wiki.db-wal"), []byte("x"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "ok.txt"), []byte("hi"), 0644))
+
+	require.Eventually(t, func() bool {
+		return countEventsUnder(t, events, filepath.Join(root, "ok.txt")) >= 1
+	}, 2*time.Second, 50*time.Millisecond)
+	// The container dir ITSELF may legitimately be recorded once as an opaque
+	// create (existing behavior); anything strictly below it must not be.
+	require.Zero(t, countEventsUnder(t, events, filepath.Join(root, ".system_data")+string(filepath.Separator)),
+		"events whose ancestor is a container dir must be dropped in handle()")
+}
+
+func TestHasContainerAncestor(t *testing.T) {
+	ig := ignore.New([]string{"node_modules"})
+	require.True(t, hasContainerAncestor(ig, "/r", "/r/.system_data/a/b.txt"))
+	require.True(t, hasContainerAncestor(ig, "/r", "/r/x/node_modules/y/z"))
+	require.False(t, hasContainerAncestor(ig, "/r", "/r/docs/a.md"))
+	require.False(t, hasContainerAncestor(ig, "/r", "/r/node_modules"), "the container dir itself is not an ancestor")
+	require.False(t, hasContainerAncestor(ig, "/r", "/elsewhere/.system_data/f"))
+}
