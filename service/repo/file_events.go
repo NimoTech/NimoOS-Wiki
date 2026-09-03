@@ -170,9 +170,23 @@ func (r *FileEventsRepo) InsertBatch(events []FileEvent) error {
 	return tx.Commit()
 }
 
+// recentForRootSQL / recentForNodeSQL are package-level so tests can EXPLAIN
+// the exact statements the hot paths run. Both carry `archived = 0`: the only
+// index covering (root_id, detected_at) is the partial
+// idx_file_events_archive_q ... WHERE archived = 0, and without that predicate
+// SQLite falls back to a full SCAN plus a temp b-tree sort — on the
+// WikiWriter's 1s ticker that is up to 50 full-table scans per second.
+// Archived rows are retention-expired (RecentChangesRetentionDays) and are
+// never "recent", so the predicate does not change what callers see.
+var recentForRootSQL = `SELECT ` + evCols + ` FROM file_events
+		WHERE root_id = ? AND archived = 0 ORDER BY detected_at DESC LIMIT ?`
+
+var recentForNodeSQL = `SELECT ` + evCols + ` FROM file_events
+		WHERE root_id = ? AND archived = 0 AND (path = ? OR path LIKE ? ESCAPE '\')
+		ORDER BY detected_at DESC LIMIT ?`
+
 func (r *FileEventsRepo) RecentForRoot(rootID string, limit int) ([]FileEvent, error) {
-	rows, err := r.db.Query(`SELECT `+evCols+` FROM file_events
-		WHERE root_id = ? ORDER BY detected_at DESC LIMIT ?`, rootID, limit)
+	rows, err := r.db.Query(recentForRootSQL, rootID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -190,9 +204,7 @@ func (r *FileEventsRepo) RecentForRoot(rootID string, limit int) ([]FileEvent, e
 
 func (r *FileEventsRepo) RecentForNode(rootID, nodePath string, limit int) ([]FileEvent, error) {
 	pattern := EscapeLikeArg(nodePath) + `/%`
-	rows, err := r.db.Query(`SELECT `+evCols+` FROM file_events
-		WHERE root_id = ? AND (path = ? OR path LIKE ? ESCAPE '\')
-		ORDER BY detected_at DESC LIMIT ?`, rootID, nodePath, pattern, limit)
+	rows, err := r.db.Query(recentForNodeSQL, rootID, nodePath, pattern, limit)
 	if err != nil {
 		return nil, err
 	}
