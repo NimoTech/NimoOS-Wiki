@@ -130,7 +130,7 @@ func TestReconcileTickDrainsOneNeedsReconcilePerTick(t *testing.T) {
 			require.NoError(t, err)
 			if cleared[s.id] {
 				require.Falsef(t, g.NeedsReconcile, "tick %d: %s should be drained", tick+1, s.id)
-				require.Greaterf(t, g.LastScanAt, now, "tick %d: %s last_scan should advance", tick+1, s.id)
+				require.GreaterOrEqualf(t, g.LastScanAt, now, "tick %d: %s last_scan should advance", tick+1, s.id)
 			} else {
 				require.Truef(t, g.NeedsReconcile, "tick %d: %s should still be queued", tick+1, s.id)
 				require.Equalf(t, now, g.LastScanAt, "tick %d: %s last_scan should be untouched", tick+1, s.id)

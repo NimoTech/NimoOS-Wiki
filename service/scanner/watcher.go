@@ -111,12 +111,8 @@ func (w *Watcher) Watch(rootID, rootPath string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.fsw == nil {
-		fsw, err := fsnotify.NewWatcher()
-		if err != nil {
-			return err
-		}
-		w.fsw = fsw
+	if err := w.ensureFSWLocked(); err != nil {
+		return err
 	}
 	w.roots[rootID] = rootPath
 
@@ -180,9 +176,34 @@ func (w *Watcher) Unwatch(rootID string) {
 	}
 }
 
+// ensureFSWLocked lazily creates the fsnotify watcher. Caller holds w.mu.
+// The watcher is created once and never replaced, so Run can read
+// w.fsw.Events without the lock after this returns.
+func (w *Watcher) ensureFSWLocked() error {
+	if w.fsw != nil {
+		return nil
+	}
+	fsw, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+	w.fsw = fsw
+	return nil
+}
+
 // Run processes events until ctx is cancelled. Call from a goroutine.
+//
+// Run creates the fsnotify watcher itself if no root has been registered yet
+// (fresh install, or every root disabled at boot). Previously it returned
+// immediately in that case; a root added later through the API then created
+// the watcher lazily inside Watch, but nothing was reading its Events channel,
+// so inotify delivery stalled and live watching was dead until restart.
 func (w *Watcher) Run(ctx context.Context) {
-	if w.fsw == nil {
+	w.mu.Lock()
+	err := w.ensureFSWLocked()
+	w.mu.Unlock()
+	if err != nil {
+		w.log.Error("fsnotify: cannot create watcher; live file watching disabled, reconcile only", zap.Error(err))
 		return
 	}
 	defer w.fsw.Close()

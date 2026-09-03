@@ -347,3 +347,32 @@ func TestHasContainerAncestor(t *testing.T) {
 	require.False(t, hasContainerAncestor(ig, "/r", "/r/node_modules"), "the container dir itself is not an ancestor")
 	require.False(t, hasContainerAncestor(ig, "/r", "/elsewhere/.system_data/f"))
 }
+
+// A fresh install has no roots when Run starts; the first root is added
+// later through the API. Run must keep serving events for roots registered
+// after it started instead of exiting because no fsnotify watcher existed yet.
+func TestWatcher_RunBeforeFirstRoot_StillDeliversEvents(t *testing.T) {
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	events := repo.NewFileEvents(d)
+	nodes := repo.NewWikiNodes(d)
+	w := NewWatcher(events, nodes, ignore.New(nil), nil, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Run(ctx) // no roots yet
+
+	root := t.TempDir()
+	require.NoError(t, w.Watch("r", root))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "late.txt"), []byte("hi"), 0644))
+	require.Eventually(t, func() bool {
+		evs, _ := events.ListUnprocessed(10)
+		for _, e := range evs {
+			if e.Op == "create" && filepath.Base(e.Path) == "late.txt" {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, 50*time.Millisecond, "events for a root added after Run started were never consumed")
+}
