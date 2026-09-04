@@ -231,3 +231,29 @@ func TestListByRootAfterPaginatesAndFiltersPresent(t *testing.T) {
 	}
 	require.Len(t, got, 25, "pagination must cover all present rows exactly once, skipping non-present")
 }
+
+func TestListPresentFilesByRootAfter_SkipsDirsAndNonPresent(t *testing.T) {
+	d, err := db.Open(":memory:")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	r := NewFileIndex(d)
+	for _, f := range []FileIndex{
+		{ID: NewID(), RootID: "r1", Path: "/a/1.md", Parent: "/a", Status: "present", Mtime: 10, Size: 1},
+		{ID: NewID(), RootID: "r1", Path: "/a/2.md", Parent: "/a", Status: "present", Mtime: 20, Size: 2},
+		{ID: NewID(), RootID: "r1", Path: "/a/sub", Parent: "/a", IsDir: true, Status: "present"},
+		{ID: NewID(), RootID: "r1", Path: "/a/gone.md", Parent: "/a", Status: "missing"},
+		{ID: NewID(), RootID: "r2", Path: "/b/3.md", Parent: "/b", Status: "present"},
+	} {
+		require.NoError(t, r.Upsert(f))
+	}
+	page1, err := r.ListPresentFilesByRootAfter("r1", "", 1)
+	require.NoError(t, err)
+	require.Len(t, page1, 1)
+	require.Equal(t, "/a/1.md", page1[0].Path)
+
+	page2, err := r.ListPresentFilesByRootAfter("r1", page1[0].Path, 10)
+	require.NoError(t, err)
+	require.Len(t, page2, 1, "dir and non-present rows must not be returned")
+	require.Equal(t, "/a/2.md", page2[0].Path)
+	require.EqualValues(t, 20, page2[0].Mtime)
+}
