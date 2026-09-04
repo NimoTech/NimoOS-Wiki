@@ -71,6 +71,39 @@ func TestArchiveSweepEnforcesRowCap(t *testing.T) {
 	require.True(t, gB.NeedsReconcile, "rootB should be marked needs_reconcile")
 }
 
+func TestArchiveSweep_MarksArchiveStateWhenRowsArchived(t *testing.T) {
+	d := openMainTestDB(t)
+	ev := repo.NewFileEvents(d)
+	roots := repo.NewWikiRoots(d)
+
+	now := time.Now().UnixMilli()
+	day := int64(24 * 3600 * 1000)
+	require.NoError(t, ev.Insert(repo.FileEvent{
+		ID: repo.NewID(), RootID: "r", Path: "/old", Op: "create",
+		DetectedAt: now - 100*day,
+	}))
+
+	state := repo.NewArchiveState(90)
+	archiveSweep(ev, roots, 90, 0, state, zap.NewNop())
+	require.True(t, state.HasArchived(), "row older than keepDays should be archived")
+}
+
+func TestArchiveSweep_DoesNotMarkArchiveStateWhenNothingArchived(t *testing.T) {
+	d := openMainTestDB(t)
+	ev := repo.NewFileEvents(d)
+	roots := repo.NewWikiRoots(d)
+
+	now := time.Now().UnixMilli()
+	require.NoError(t, ev.Insert(repo.FileEvent{
+		ID: repo.NewID(), RootID: "r", Path: "/fresh", Op: "create",
+		DetectedAt: now,
+	}))
+
+	state := repo.NewArchiveState(90)
+	archiveSweep(ev, roots, 90, 0, state, zap.NewNop())
+	require.False(t, state.HasArchived(), "fresh row should not be archived")
+}
+
 func TestRootDueAtBoot(t *testing.T) {
 	now := time.Now().UnixMilli()
 	cases := []struct {

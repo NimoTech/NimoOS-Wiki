@@ -25,6 +25,30 @@ func TestFileEvents_ArchiveAndPurge(t *testing.T) {
 	require.Equal(t, int64(1), n2, "one event purged")
 }
 
+func TestHasArchived_OnlyLooksAtOldestRow(t *testing.T) {
+	d := openTestDB(t)
+	r := NewFileEvents(d)
+	_ = r.Insert(FileEvent{RootID: "r", Path: "/a", Op: "create", DetectedAt: 1})
+	_ = r.Insert(FileEvent{RootID: "r", Path: "/b", Op: "create", DetectedAt: 100})
+
+	n, err := r.ArchiveOlderThan(50)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, n)
+
+	has, err := r.HasArchived()
+	require.NoError(t, err)
+	require.True(t, has, "oldest row (by rowid) was archived")
+
+	d2 := openTestDB(t)
+	r2 := NewFileEvents(d2)
+	_ = r2.Insert(FileEvent{RootID: "r", Path: "/a", Op: "create", DetectedAt: 1})
+	_ = r2.Insert(FileEvent{RootID: "r", Path: "/b", Op: "create", DetectedAt: 100})
+
+	has2, err := r2.HasArchived()
+	require.NoError(t, err)
+	require.False(t, has2, "nothing archived yet")
+}
+
 func TestInsertBatchAndPurgeByRootExceptDeletes(t *testing.T) {
 	d := openTestDB(t)
 	r := NewFileEvents(d)

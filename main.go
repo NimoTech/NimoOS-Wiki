@@ -100,15 +100,16 @@ func main() {
 	rParse := repo.NewParseStatus(d)
 	rSummaries := repo.NewWikiSummaries(d)
 
+	// Trim / rebuild file_events BEFORE any loop issues its first query
+	// (spec §3.4). Synchronous on purpose: a bloated table must never meet
+	// the once-per-second fuse tick.
+	stopHB := startupHeartbeat(zapLog)
+
 	archiveState := repo.NewArchiveState(config.Cfg.RecentChangesRetentionDays)
 	if err := archiveState.InitFromRepo(rEvents); err != nil {
 		zapLog.Warn("archive state init", zap.Error(err))
 	}
 
-	// Trim / rebuild file_events BEFORE any loop issues its first query
-	// (spec §3.4). Synchronous on purpose: a bloated table must never meet
-	// the once-per-second fuse tick.
-	stopHB := startupHeartbeat(zapLog)
 	startupSweep(rEvents, rRoots, d, dbPath, config.Cfg.RecentChangesRetentionDays,
 		config.Cfg.EventMaxRows, diskAvail, archiveState, zapLog)
 	// Built only now: on a bloated table this index costs minutes and GBs of
@@ -783,10 +784,12 @@ func archiveSweep(ev *repo.FileEventsRepo, roots *repo.WikiRootsRepo,
 	}
 	archiveCutoff := time.Now().Add(-time.Duration(keepDays) * 24 * time.Hour).UnixMilli()
 	purgeCutoff := time.Now().Add(-time.Duration(keepDays*2) * 24 * time.Hour).UnixMilli()
-	if n, err := ev.ArchiveOlderThan(archiveCutoff); err != nil {
-		log.Warn("archive older than", zap.Error(err))
-	} else if n > 0 && state != nil {
+	n, err := ev.ArchiveOlderThan(archiveCutoff)
+	if n > 0 && state != nil {
 		state.MarkArchived()
+	}
+	if err != nil {
+		log.Warn("archive older than", zap.Error(err))
 	}
 	if _, err := ev.PurgeOlderThan(purgeCutoff); err != nil {
 		log.Warn("purge older than", zap.Error(err))
