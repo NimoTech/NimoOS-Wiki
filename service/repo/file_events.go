@@ -2,6 +2,7 @@ package repo
 
 import (
 	"database/sql"
+	"errors"
 	"strings"
 )
 
@@ -368,17 +369,20 @@ func nullableStr(s string) interface{} {
 	return s
 }
 
-// HasArchived reports whether any row has ever been archived. LIMIT 1 stops
-// at the first hit; on a never-archived table it is a full scan, which is
-// acceptable once at startup.
+// HasArchived reports whether history has ever been archived. Archived rows are
+// always the oldest (ArchiveOlderThan marks detected_at < cutoff and rowid tracks
+// insert order), so the minimum rowid answers the question in O(1) — no index on
+// `archived` exists and a full scan of a bloated table before startup would risk
+// systemd's start timeout. Rows purged at 2×keepDays make this return false, the
+// same blind spot the previous full scan had.
 func (r *FileEventsRepo) HasArchived() (bool, error) {
-	var one int
-	err := r.db.QueryRow(`SELECT 1 FROM file_events WHERE archived = 1 LIMIT 1`).Scan(&one)
-	if err == sql.ErrNoRows {
+	var archived int
+	err := r.db.QueryRow(`SELECT archived FROM file_events WHERE rowid = (SELECT MIN(rowid) FROM file_events)`).Scan(&archived)
+	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	return true, nil
+	return archived == 1, nil
 }

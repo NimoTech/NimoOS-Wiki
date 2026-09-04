@@ -232,8 +232,7 @@ func TestPostSummary_RejectsMissingBasedOn(t *testing.T) {
 }
 
 func TestInternalFileEvents_ExposesArchiveHorizon(t *testing.T) {
-	d, dep := setupInternalTest(t)
-	_ = d
+	_, dep := setupInternalTest(t)
 	dep.Archive = repo.NewArchiveState(90)
 	dep.Archive.MarkArchived()
 	e := echo.New()
