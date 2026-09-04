@@ -108,6 +108,28 @@ func (r *FileIndexRepo) ListByRootAfter(rootID, afterPath string, limit int) ([]
 	return out, rows.Err()
 }
 
+// ListPresentFilesByRootAfter is the Parser's verify feed: present, non-dir
+// rows only, keyset-paged by path so a directory-heavy page can't starve the
+// limit. Filtered in SQL, not in Go, for that reason.
+func (r *FileIndexRepo) ListPresentFilesByRootAfter(rootID, afterPath string, limit int) ([]FileIndex, error) {
+	rows, err := r.db.Query(`SELECT `+fileIndexCols+` FROM file_index
+		WHERE root_id = ? AND status = 'present' AND is_dir = 0 AND path > ?
+		ORDER BY path LIMIT ?`, rootID, afterPath, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FileIndex
+	for rows.Next() {
+		f, err := r.scan(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *f)
+	}
+	return out, rows.Err()
+}
+
 func (r *FileIndexRepo) DeleteByPath(rootID, path string) error {
 	_, err := r.db.Exec(`DELETE FROM file_index WHERE root_id = ? AND path = ?`, rootID, path)
 	return err
