@@ -100,12 +100,17 @@ func main() {
 	rParse := repo.NewParseStatus(d)
 	rSummaries := repo.NewWikiSummaries(d)
 
+	archiveState := repo.NewArchiveState(config.Cfg.RecentChangesRetentionDays)
+	if err := archiveState.InitFromRepo(rEvents); err != nil {
+		zapLog.Warn("archive state init", zap.Error(err))
+	}
+
 	// Trim / rebuild file_events BEFORE any loop issues its first query
 	// (spec §3.4). Synchronous on purpose: a bloated table must never meet
 	// the once-per-second fuse tick.
 	stopHB := startupHeartbeat(zapLog)
 	startupSweep(rEvents, rRoots, d, dbPath, config.Cfg.RecentChangesRetentionDays,
-		config.Cfg.EventMaxRows, diskAvail, zapLog)
+		config.Cfg.EventMaxRows, diskAvail, archiveState, zapLog)
 	// Built only now: on a bloated table this index costs minutes and GBs of
 	// WAL, so it must come after the sweep has trimmed or rebuilt the table.
 	if err := db.EnsureBacklogIndex(d); err != nil {
@@ -203,7 +208,7 @@ func main() {
 		}
 		runReconcilerLoop(ctx, rRoots, rec, guard, rEvents)
 	}()
-	go runArchiveJob(ctx, rEvents, rRoots, config.Cfg.RecentChangesRetentionDays, config.Cfg.EventMaxRows)
+	go runArchiveJob(ctx, rEvents, rRoots, config.Cfg.RecentChangesRetentionDays, config.Cfg.EventMaxRows, archiveState)
 	// Authz-source decoupling Task 5 critical fix (option B): a dedicated retry
 	// loop, fully independent from the FS rescan reconcileTick above, that only
 	// consumes needs_authz_push / the manager's in-memory dirty flag.
@@ -240,6 +245,7 @@ func main() {
 		Files:       rFiles,
 		Events:      rEvents,
 		Summaries:   rSummaries,
+		Archive:     archiveState,
 		RuntimePath: config.Cfg.RuntimePath,
 	})
 
@@ -643,7 +649,8 @@ func startupHeartbeat(log *zap.Logger) (stop func()) {
 // systemd retry. availBytes is injected so tests don't depend on the real
 // filesystem.
 func startupSweep(ev *repo.FileEventsRepo, roots *repo.WikiRootsRepo, d *sql.DB, dbPath string,
-	keepDays int, maxRows int64, availBytes func(dir string) (uint64, error), log *zap.Logger) {
+	keepDays int, maxRows int64, availBytes func(dir string) (uint64, error),
+	state *repo.ArchiveState, log *zap.Logger) {
 	if maxRows <= 0 {
 		log.Info("file_events startup sweep skipped: row cap disabled")
 		return
@@ -723,7 +730,7 @@ func startupSweep(ev *repo.FileEventsRepo, roots *repo.WikiRootsRepo, d *sql.DB,
 	}
 
 	t0 := time.Now()
-	archiveSweep(ev, roots, keepDays, maxRows, log)
+	archiveSweep(ev, roots, keepDays, maxRows, state, log)
 	log.Info("file_events startup sweep done", zap.Duration("took", time.Since(t0)))
 }
 
@@ -749,7 +756,7 @@ func diskAvail(dir string) (uint64, error) {
 // archiveSweep itself now also defaults keepDays <= 0 to 90, since it is
 // shared with startupSweep's regular-path call.
 func runArchiveJob(ctx context.Context, ev *repo.FileEventsRepo, roots *repo.WikiRootsRepo,
-	keepDays int, maxRows int64) {
+	keepDays int, maxRows int64, state *repo.ArchiveState) {
 	if keepDays <= 0 {
 		keepDays = 90
 	}
@@ -760,7 +767,7 @@ func runArchiveJob(ctx context.Context, ev *repo.FileEventsRepo, roots *repo.Wik
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			archiveSweep(ev, roots, keepDays, maxRows, zapLog)
+			archiveSweep(ev, roots, keepDays, maxRows, state, zapLog)
 		}
 	}
 }
@@ -770,14 +777,16 @@ func runArchiveJob(ctx context.Context, ev *repo.FileEventsRepo, roots *repo.Wik
 // rows were cap-purged are marked needs_reconcile — Wiki cannot know the
 // Parser cursor, so treat every capped purge as destroying unconsumed rows.
 func archiveSweep(ev *repo.FileEventsRepo, roots *repo.WikiRootsRepo,
-	keepDays int, maxRows int64, log *zap.Logger) {
+	keepDays int, maxRows int64, state *repo.ArchiveState, log *zap.Logger) {
 	if keepDays <= 0 {
 		keepDays = 90
 	}
 	archiveCutoff := time.Now().Add(-time.Duration(keepDays) * 24 * time.Hour).UnixMilli()
 	purgeCutoff := time.Now().Add(-time.Duration(keepDays*2) * 24 * time.Hour).UnixMilli()
-	if _, err := ev.ArchiveOlderThan(archiveCutoff); err != nil {
+	if n, err := ev.ArchiveOlderThan(archiveCutoff); err != nil {
 		log.Warn("archive older than", zap.Error(err))
+	} else if n > 0 && state != nil {
+		state.MarkArchived()
 	}
 	if _, err := ev.PurgeOlderThan(purgeCutoff); err != nil {
 		log.Warn("purge older than", zap.Error(err))

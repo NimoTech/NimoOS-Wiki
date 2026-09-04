@@ -120,7 +120,57 @@ func getInternalFileEvents(d Deps) echo.HandlerFunc {
 		if evs == nil {
 			evs = []repo.FileEvent{}
 		}
-		return c.JSON(http.StatusOK, map[string]any{"events": evs})
+		var cutoff int64
+		has := false
+		if d.Archive != nil {
+			cutoff = d.Archive.CutoffMs(time.Now())
+			has = d.Archive.HasArchived()
+		}
+		return c.JSON(http.StatusOK, map[string]any{
+			"events":            evs,
+			"archive_cutoff_ms": cutoff,
+			"has_archived":      has,
+		})
+	}
+}
+
+type internalFileEntry struct {
+	Path    string `json:"path"`
+	MtimeMs int64  `json:"mtime_ms"`
+	Size    int64  `json:"size"`
+}
+
+// getInternalFiles is the Parser's verify feed: Wiki's authoritative list of
+// present, non-directory files under a root, keyset-paged by path.
+func getInternalFiles(d Deps) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		rootID := c.QueryParam("root_id")
+		if rootID == "" {
+			return echo.NewHTTPError(http.StatusBadRequest, "root_id required")
+		}
+		if _, err := d.WikiRoots.Get(rootID); err != nil {
+			return echo.NewHTTPError(http.StatusNotFound, "root not found")
+		}
+		limit, _ := strconv.Atoi(c.QueryParam("limit"))
+		if limit <= 0 {
+			limit = 1000
+		}
+		if limit > 5000 {
+			limit = 5000
+		}
+		rows, err := d.Files.ListPresentFilesByRootAfter(rootID, c.QueryParam("after"), limit)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+		files := make([]internalFileEntry, 0, len(rows))
+		for _, f := range rows {
+			files = append(files, internalFileEntry{Path: f.Path, MtimeMs: f.Mtime, Size: f.Size})
+		}
+		next := ""
+		if len(rows) == limit {
+			next = rows[len(rows)-1].Path
+		}
+		return c.JSON(http.StatusOK, map[string]any{"files": files, "next_after": next})
 	}
 }
 
