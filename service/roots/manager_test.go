@@ -377,7 +377,7 @@ func TestCreateSkipsContainerDirsInPrecheck(t *testing.T) {
 	require.Equal(t, "auto", r.WatchMode)
 }
 
-func TestDeleteCascadesFileIndexAndEmitsTombstones(t *testing.T) {
+func TestDeleteCascadesFileIndexAndEmitsRootRemoved(t *testing.T) {
 	d, err := db.Open(":memory:")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = d.Close() })
@@ -410,19 +410,20 @@ func TestDeleteCascadesFileIndexAndEmitsTombstones(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, rows)
 
-	// old create events are purged; each file (excluding directories) gets one
-	// pre-marked-processed delete tombstone
+	// old create events are purged; the root's removal is ONE event, not one
+	// delete per file (a 40k-file root used to fan out 40k Parser jobs).
 	evs, err := rEvents.ListSince(id, 0, 100)
 	require.NoError(t, err)
-	var tombs []repo.FileEvent
-	for _, e := range evs {
-		require.Equal(t, "delete", e.Op, "non-delete events must be purged")
-		tombs = append(tombs, e)
-	}
-	require.Len(t, tombs, 2) // x.txt + y.pdf, not sub/
-	for _, e := range tombs {
-		require.NotZero(t, e.ProcessedAt, "tombstones must be pre-marked processed")
-	}
+	require.Len(t, evs, 1)
+	require.Equal(t, "root_removed", evs[0].Op)
+	require.Equal(t, "", evs[0].Path)
+	require.False(t, evs[0].IsDir)
+	require.NotZero(t, evs[0].ProcessedAt, "pre-marked processed: Wiki's own processor must skip it")
+
+	// Wiki's own event processor never sees it.
+	unprocessed, err := rEvents.ListUnprocessed(100)
+	require.NoError(t, err)
+	require.Empty(t, unprocessed)
 }
 
 func TestCountDirsQuickTimeoutTreatedAsExceeded(t *testing.T) {
