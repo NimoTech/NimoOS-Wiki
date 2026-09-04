@@ -367,3 +367,18 @@ func nullableStr(s string) interface{} {
 	}
 	return s
 }
+
+// HasArchived reports whether any row has ever been archived. LIMIT 1 stops
+// at the first hit; on a never-archived table it is a full scan, which is
+// acceptable once at startup.
+func (r *FileEventsRepo) HasArchived() (bool, error) {
+	var one int
+	err := r.db.QueryRow(`SELECT 1 FROM file_events WHERE archived = 1 LIMIT 1`).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
