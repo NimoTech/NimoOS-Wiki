@@ -313,3 +313,16 @@ func TestInternalFiles_PagesPresentFilesAndRejectsUnknownRoot(t *testing.T) {
 	e.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusNotFound, rec.Code)
 }
+
+func TestInternalFiles_DBErrorIs500NotNotFound(t *testing.T) {
+	d, dep := setupInternalTest(t)
+	require.NoError(t, d.Close())
+
+	e := echo.New()
+	e.GET("/v1/wiki/_internal/files", getInternalFiles(dep))
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/wiki/_internal/files?root_id=any", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+}

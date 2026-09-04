@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"errors"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -149,7 +150,12 @@ func getInternalFiles(d Deps) echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusBadRequest, "root_id required")
 		}
 		if _, err := d.WikiRoots.Get(rootID); err != nil {
-			return echo.NewHTTPError(http.StatusNotFound, "root not found")
+			switch {
+			case errors.Is(err, repo.ErrNotFound):
+				return echo.NewHTTPError(http.StatusNotFound, "root not found")
+			default:
+				return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+			}
 		}
 		limit, _ := strconv.Atoi(c.QueryParam("limit"))
 		if limit <= 0 {
