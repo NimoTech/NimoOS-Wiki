@@ -1,22 +1,26 @@
 package repo
 
+// WikiRoot is served verbatim by GET /v1/wiki/roots. The json tags pin the
+// PascalCase wire keys every consumer (UI, NimoOS-AI, NimoOS-Parser, CLI)
+// already reads; see models_wire_test.go. Renaming a field must not rename
+// its key.
 type WikiRoot struct {
-	ID             string
-	Path           string
-	Level          string
-	WatchMode      string
-	StorageMode    string
-	Enabled        bool
-	ScanIntervalS  int
-	CreatedAt      int64
-	LastScanAt     int64
-	NeedsReconcile bool
+	ID             string `json:"ID"`
+	Path           string `json:"Path"`
+	Level          string `json:"Level"`
+	WatchMode      string `json:"WatchMode"`
+	StorageMode    string `json:"StorageMode"`
+	Enabled        bool   `json:"Enabled"`
+	ScanIntervalS  int    `json:"ScanIntervalS"`
+	CreatedAt      int64  `json:"CreatedAt"`
+	LastScanAt     int64  `json:"LastScanAt"`
+	NeedsReconcile bool   `json:"NeedsReconcile"`
 	// NeedsAuthzPush marks that this row's core authz push (Upsert) once
 	// failed and is pending correction by the dedicated retry loop's full
 	// Reconcile (authz-source-decoupling Task 5 critical fix: unrelated to
 	// NeedsReconcile's semantics — the latter is the FS-rescan signal, see
 	// service/roots/manager.go pushUpsert).
-	NeedsAuthzPush bool
+	NeedsAuthzPush bool `json:"NeedsAuthzPush"`
 }
 
 type WikiNode struct {
