@@ -230,3 +230,86 @@ func TestPostSummary_RejectsMissingBasedOn(t *testing.T) {
 	InitRouter(mgrs).ServeHTTP(rec, req)
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 }
+
+func TestInternalFileEvents_ExposesArchiveHorizon(t *testing.T) {
+	d, dep := setupInternalTest(t)
+	_ = d
+	dep.Archive = repo.NewArchiveState(90)
+	dep.Archive.MarkArchived()
+	e := echo.New()
+	e.GET("/v1/wiki/_internal/file-events", getInternalFileEvents(dep))
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/wiki/_internal/file-events?since=0&after_seq=0&limit=10", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var body struct {
+		Events          []repo.FileEvent `json:"events"`
+		ArchiveCutoffMs int64            `json:"archive_cutoff_ms"`
+		HasArchived     bool             `json:"has_archived"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.True(t, body.HasArchived)
+	require.InDelta(t, time.Now().Add(-90*24*time.Hour).UnixMilli(), body.ArchiveCutoffMs, 5000)
+}
+
+func TestInternalFileEvents_NoArchiveStateStillHasFields(t *testing.T) {
+	_, dep := setupInternalTest(t)
+	e := echo.New()
+	e.GET("/v1/wiki/_internal/file-events", getInternalFileEvents(dep))
+	req := httptest.NewRequest(http.MethodGet, "/v1/wiki/_internal/file-events?since=0&limit=10", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Contains(t, body, "archive_cutoff_ms")
+	require.Equal(t, false, body["has_archived"])
+}
+
+func TestInternalFiles_PagesPresentFilesAndRejectsUnknownRoot(t *testing.T) {
+	_, dep := setupInternalTest(t)
+	rootID := "root-files"
+	require.NoError(t, dep.WikiRoots.Insert(repo.WikiRoot{ID: rootID, Path: "/DATA", Level: "space", Enabled: true}))
+	for _, f := range []repo.FileIndex{
+		{ID: repo.NewID(), RootID: rootID, Path: "/DATA/a.md", Parent: "/DATA", Status: "present", Mtime: 111, Size: 5},
+		{ID: repo.NewID(), RootID: rootID, Path: "/DATA/b.md", Parent: "/DATA", Status: "present", Mtime: 222, Size: 6},
+		{ID: repo.NewID(), RootID: rootID, Path: "/DATA/dir", Parent: "/DATA", IsDir: true, Status: "present"},
+	} {
+		require.NoError(t, dep.Files.Upsert(f))
+	}
+	e := echo.New()
+	e.GET("/v1/wiki/_internal/files", getInternalFiles(dep))
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/wiki/_internal/files?root_id="+rootID+"&limit=1", nil)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var page struct {
+		Files []struct {
+			Path    string `json:"path"`
+			MtimeMs int64  `json:"mtime_ms"`
+			Size    int64  `json:"size"`
+		} `json:"files"`
+		NextAfter string `json:"next_after"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &page))
+	require.Len(t, page.Files, 1)
+	require.Equal(t, "/DATA/a.md", page.Files[0].Path)
+	require.EqualValues(t, 111, page.Files[0].MtimeMs)
+	require.Equal(t, "/DATA/a.md", page.NextAfter)
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/wiki/_internal/files?root_id="+rootID+"&after=/DATA/a.md&limit=10", nil)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &page))
+	require.Len(t, page.Files, 1, "dir must not appear")
+	require.Equal(t, "/DATA/b.md", page.Files[0].Path)
+	require.Equal(t, "", page.NextAfter, "short page ends the listing")
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/wiki/_internal/files?root_id=nope", nil)
+	rec = httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusNotFound, rec.Code)
+}

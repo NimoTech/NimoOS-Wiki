@@ -56,7 +56,7 @@ func TestArchiveSweepEnforcesRowCap(t *testing.T) {
 		}))
 	}
 
-	archiveSweep(ev, roots, 90, 6, zap.NewNop())
+	archiveSweep(ev, roots, 90, 6, nil, zap.NewNop())
 
 	total, err := ev.CountAll()
 	require.NoError(t, err)
@@ -494,7 +494,7 @@ func TestStartupSweep_RegularPathTrimsToCap(t *testing.T) {
 
 	// 10 rows, cap 6: 10 <= 10*6 so the regular path (archiveSweep) runs.
 	startupSweep(ev, roots, d, ":memory:", 90, 6,
-		func(string) (uint64, error) { return 1 << 40, nil }, zap.NewNop())
+		func(string) (uint64, error) { return 1 << 40, nil }, nil, zap.NewNop())
 
 	total, err := ev.CountAll()
 	require.NoError(t, err)
@@ -516,7 +516,7 @@ func TestStartupSweep_BloatedFastPathRecreatesTable(t *testing.T) {
 
 	probed := false
 	startupSweep(ev, roots, d, dbPath, 90, 10,
-		func(string) (uint64, error) { probed = true; return 1 << 40, nil }, zap.NewNop())
+		func(string) (uint64, error) { probed = true; return 1 << 40, nil }, nil, zap.NewNop())
 
 	total, err := ev.CountAll()
 	require.NoError(t, err)
@@ -543,7 +543,7 @@ func TestStartupSweep_FastPathSkipsVacuumOnProbeError(t *testing.T) {
 
 	// avail probe errors → VACUUM skipped, but recreate still happened.
 	startupSweep(ev, roots, d, dbPath, 90, 10,
-		func(string) (uint64, error) { return 0, fmt.Errorf("statfs: boom") }, zap.NewNop())
+		func(string) (uint64, error) { return 0, fmt.Errorf("statfs: boom") }, nil, zap.NewNop())
 
 	total, err := ev.CountAll()
 	require.NoError(t, err)
@@ -561,7 +561,7 @@ func TestStartupSweep_FastPathSkipsVacuumWhenLowDisk(t *testing.T) {
 
 	// Numeric arm: probe succeeds but there is no free space at all.
 	startupSweep(ev, roots, d, dbPath, 90, 10,
-		func(string) (uint64, error) { return 0, nil }, zap.NewNop())
+		func(string) (uint64, error) { return 0, nil }, nil, zap.NewNop())
 
 	total, err := ev.CountAll()
 	require.NoError(t, err)
@@ -593,7 +593,7 @@ func TestStartupSweep_CapDisabledIsNoop(t *testing.T) {
 	insertEvents(t, ev, 50)
 
 	startupSweep(ev, roots, d, ":memory:", 90, 0,
-		func(string) (uint64, error) { return 1 << 40, nil }, zap.NewNop())
+		func(string) (uint64, error) { return 1 << 40, nil }, nil, zap.NewNop())
 
 	total, err := ev.CountAll()
 	require.NoError(t, err)

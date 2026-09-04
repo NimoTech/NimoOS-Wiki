@@ -14,12 +14,16 @@ import (
 
 // Deps bundles the collaborators the v1 router needs from main.
 type Deps struct {
-	Roots       *roots.Manager
-	WikiRoots   *repo.WikiRootsRepo
-	Nodes       *repo.WikiNodesRepo
-	Files       *repo.FileIndexRepo
-	Events      *repo.FileEventsRepo
-	Summaries   *repo.WikiSummariesRepo
+	Roots     *roots.Manager
+	WikiRoots *repo.WikiRootsRepo
+	Nodes     *repo.WikiNodesRepo
+	Files     *repo.FileIndexRepo
+	Events    *repo.FileEventsRepo
+	Summaries *repo.WikiSummariesRepo
+	// Archive is the file_events archive horizon surfaced on the internal
+	// feed so the Parser can detect a cursor that fell behind it. Nil in
+	// tests that don't care; the handler then reports has_archived=false.
+	Archive     *repo.ArchiveState
 	RuntimePath string
 }
 
@@ -54,6 +58,7 @@ func InitRouter(d Deps) *echo.Echo {
 	// C: internal — no JWT, localhost only.
 	i := e.Group("/v1/wiki/_internal", route.LocalhostOnly)
 	i.GET("/file-events", getInternalFileEvents(d))
+	i.GET("/files", getInternalFiles(d))
 	i.GET("/needs-summary", getInternalNeedsSummary(d))
 	i.GET("/node-evidence", getInternalNodeEvidence(d))
 	i.POST("/summary", postInternalSummary(d))
