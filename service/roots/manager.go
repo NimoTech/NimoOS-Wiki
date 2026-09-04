@@ -386,37 +386,18 @@ func (m *Manager) Delete(id string, purgeFiles bool) error {
 		if _, err := m.events.PurgeByRootExceptDeletes(id); err != nil {
 			return err
 		}
-		// 2) One delete tombstone per indexed file so the Parser drops its
-		//    records (content-addressed refcounting keeps shared content
-		//    alive; real vector deletion happens after its 24h GC grace).
-		//    Pre-marked processed_at: our own processor must not re-consume
-		//    them, and they must not count as backlog for the storm fuse —
-		//    the internal file-events feed returns processed rows anyway
-		//    (ListSince filters on archived only). Same-millisecond bursts
-		//    are safe for the Parser via seq keyset pagination.
-		after := ""
-		for {
-			batch, err := m.files.ListByRootAfter(id, after, 5000)
-			if err != nil {
-				return err
-			}
-			if len(batch) == 0 {
-				break
-			}
-			evs := make([]repo.FileEvent, 0, len(batch))
-			for _, f := range batch {
-				if f.IsDir || f.Status != "present" {
-					continue
-				}
-				evs = append(evs, repo.FileEvent{
-					RootID: id, Path: f.Path, Op: "delete",
-					DetectedAt: now, ProcessedAt: now,
-				})
-			}
-			if err := m.events.InsertBatch(evs); err != nil {
-				return err
-			}
-			after = batch[len(batch)-1].Path
+		// 2) One root_removed event. The Parser retires every record under
+		//    this root_id in a single pass (service_retire.retire_root); the
+		//    previous per-file delete fan-out queued one job per tracked file
+		//    (40k on an OS-overlay root) and was almost entirely no-ops.
+		//    Pre-marked processed_at: our own processor must not consume it
+		//    and it must not count as backlog for the storm fuse; the
+		//    internal feed returns processed rows anyway.
+		if err := m.events.InsertBatch([]repo.FileEvent{{
+			RootID: id, Path: "", Op: "root_removed", IsDir: false,
+			DetectedAt: now, ProcessedAt: now,
+		}}); err != nil {
+			return err
 		}
 		// 3) Drop the root's file_index rows.
 		if _, err := m.files.DeleteByRoot(id); err != nil {
